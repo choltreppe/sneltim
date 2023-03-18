@@ -15,4 +15,4 @@ requires "parlexgen >= 0.1.7"
 
 task test, "test":
   withDir "tests":
-    exec "nim js test.nim"
+    exec "nim js test_app.nim"
