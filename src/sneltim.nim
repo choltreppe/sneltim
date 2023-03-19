@@ -5,24 +5,32 @@ import sneltim/templhtml
 
 
 type
-  Component* = object
+  Component*[P: proc] = object
     mount*: proc(parent, hook: Node)
-    patch*: proc(changed: seq[bool])
+    patch*: P
     detatch*: proc(parent: Node)
 
+func newComponent[P: proc](mount: proc(parent, hook: Node), patch: P, detatch: proc(parent: Node)): Component[P] =
+  Component[P](mount: mount, patch: patch, detatch: detatch)
 
-const
-  patchMapName = "sneltimPatchMap"
-  withPatchingTemplateName ="sneltimWithPatching"
-  patchSelfName = "sneltimPatchSelf"
+
+let
+  patchMap {.compiletime.} = genSym(nskConst, "patchMap")
+  exportedVarMap {.compiletime.} = genSym(nskConst, "exportMap")
+  exportedVarLabel {.compiletime.} = genSym(nsklabel, "exportVar")
+  withPatchingTemplate {.compiletime.} = genSym(nskTemplate, "withPatching")
+  patchSelf {.compiletime.} = genSym(nskVar, "patchSelf")
 
 
 # just a container for recognition in typed macro
 proc dynamicContent[T](v: T) = discard
 
+{.pragma: exportField.}
+
+func `=~=`(a,b: string): bool = cmpIgnoreStyle(a, b) == 0
+
 
 macro generatePatchHandling(body: typed): untyped =
-  
   result = newStmtList()
 
   var
@@ -49,13 +57,20 @@ macro generatePatchHandling(body: typed): untyped =
     else: discard
 
 
-  body.expectKind nnkStmtList
+  let body =
+    if body.kind in {nnkStmtList, nnkStmtListExpr}: body
+    else: newStmtList(body)
+
+  var exportedVarMapImpl = nnkBracket.newTree()
+
   for stmt in body:
     case stmt.kind
     of nnkVarSection:
       result.add stmt
       for def in stmt:
         memberVars.add def[0]
+        if def[2].kind in {nnkBlockStmt, nnkBlockExpr} and def[2][0] == exportedVarLabel:
+          exportedVarMapImpl.add newLit(high(memberVars))
 
     of nnkProcDef, nnkFuncDef:
       result.add stmt
@@ -63,20 +78,24 @@ macro generatePatchHandling(body: typed): untyped =
       memberProcs &= stmt[0]
 
     of nnkCall, nnkCommand:
-      if stmt[0].kind == nnkSym and cmpIgnoreStyle($stmt[0], "dynamicContent") == 0:
+      if stmt[0].kind == nnkSym and $stmt[0] =~= "dynamicContent":
         stmt.expectLen 2
         contentRefs &= findMemberRefs(stmt[1])
 
-    else: discard
+    else:
+      result.add stmt
+
+
+  result.add: quote do:
+    const `exportedVarMap` = `exportedVarMapImpl`
 
 
   var patchMapImpl = nnkBracket.newTree()  # patchId  ->  memberIds
   for patchId, memberIds in contentRefs:
     patchMapImpl.add: quote do: @`memberIds`
 
-  let patchMap = ident(patchMapName)
   result.add quote do:
-    let `patchMap`  = `patchMapImpl`
+    const `patchMap` = @`patchMapImpl`
 
 
   let withPatchingParam = genSym(nskParam, "body")
@@ -92,7 +111,6 @@ macro generatePatchHandling(body: typed): untyped =
         if `memberVar` != `prev`:
           `changed`[`id`] = true
     let len = len(memberVars)
-    let patchSelf = ident(patchSelfName)
     quote do:
       `safePrevVal`
       `withPatchingParam`
@@ -100,58 +118,106 @@ macro generatePatchHandling(body: typed): untyped =
       `compare`
       `patchSelf`(`changed`)
 
-  let withPatching = ident(withPatchingTemplateName)
   result.add quote do:
-    template `withPatching`(`withPatchingParam`) =
+    template `withPatchingTemplate`(`withPatchingParam`) =
       `withPatchingImpl`
+  debugEcho repr result
 
 
 
-macro component*(componentName, body: untyped): untyped =
-  componentName.expectKind {nnkIdent, nnkSym}
+macro component*(body: untyped): untyped =
   body.expectKind nnkStmtList
+
+  let
+    nodesArray = genSym(nskVar, "nodes")
+    mountParent = genSym(nskParam, "parent")
+    mountHook = genSym(nskParam, "hook")
+    patchSelfChanged = genSym(nskParam, "changed")
+    patchChanged = genSym(nskParam, "changed")
+    detatchParent = genSym(nskParam, "parent")
+
+  var
+    createImpl = newStmtList()
+    mountImpl = newStmtList()
+    patchSelfImpl = newStmtList()
+    patchImpl = newStmtList()
+    detatchImpl = newStmtList()
+
 
   var templStr = ""
   var bodyForPatchGen = newStmtList()
+  var patchParams = nnkFormalParams.newTree(newEmptyNode())
+
   for stmt in body:
     if stmt.kind in {nnkCommand, nnkCall, nnkCallStrLit} and
-       cmpIgnoreStyle(stmt[0].strVal, "templ") == 0:
+       stmt[0].strVal =~= "templ":
           stmt.expectLen 2
           assert templStr == ""
           templStr = stmt[1].strVal
+
+    elif stmt.kind == nnkVarSection:
+      # mark exported vars with labeled block:
+      var varDefs = nnkVarSection.newTree()
+      for def in stmt:
+        if def[0].kind == nnkPostfix and $def[0][0] == "*":
+          # patch proc:
+          let memberVar = def[0][1]
+          let paramVar = genSym(nskParam, $memberVar)
+          patchParams.add nnkIdentDefs.newTree(paramVar, def[1], def[2])
+          patchImpl.add newAssignment(memberVar, paramVar)
+          # add var def:
+          let td = def[1]
+          let body = def[2]
+          varDefs.add nnkIdentDefs.newTree(
+            memberVar,
+            td,
+            nnkBlockStmt.newTree(exportedVarLabel,
+              if body.kind == nnkEmpty:
+                quote do: default(`td`)
+              else: body
+            )
+          )
+        else:
+          varDefs.add def
+      bodyForPatchGen.add varDefs
+
     else:
       bodyForPatchGen.add stmt
 
   assert templStr != ""
   let templ = parseTempl(templStr)
 
-  let
-    nodesArray    = genSym(nskVar, "nodes")
-    mountParent   = genSym(nskParam, "parent")
-    mountHook     = genSym(nskParam, "hook")
-    patchChanged  = genSym(nskParam, "changed")
-    detatchParent = genSym(nskParam, "parent")
 
-  var
-    createBody  = newStmtList()
-    mountBody   = newStmtList()
-    patchBody   = newStmtList()
-    detatchBody = newStmtList()
-  
+  patchParams.add nnkIdentDefs.newTree(
+    patchChanged,
+    nnkBracketExpr.newTree(bindSym"array", newLit(len(patchParams) - 1), bindSym"bool"),
+    newEmptyNode()
+  )
+  patchImpl.add: quote do:
+    when len(`exportedVarMap`) > 0:
+      var changed = newSeq[bool](len(`patchMap`))
+      for i, v in `patchChanged`:
+        changed[`exportedVarMap`[i]] = v
+      `patchSelf`(changed)
+
+  let patchDef = nnkLambda.newTree(
+    newEmptyNode(), newEmptyNode(), newEmptyNode(),
+    patchParams,
+    newEmptyNode(), newEmptyNode(),
+    patchImpl
+  )
+
+
   var
     nodeId = -1
-    nextPatchId = 0
+    nextPatchId = 0  
 
-  let patchMap = ident(patchMapName)
-  let withPatching = ident(withPatchingTemplateName)
-  let patchSelf = ident(patchSelfName)
-
-  proc addPatchContent(anylizeCode, patchCode: NimNode) =
+  proc addPatchSelfContent(anylizeCode, patchCode: NimNode) =
     bodyForPatchGen.add quote do:
       dynamicContent(`anylizeCode`)
     let it = ident"it"
-    patchBody.add: quote do:
-      if `patchMap`[`nextPatchId`].anyIt(`patchChanged`[`it`]):
+    patchSelfImpl.add: quote do:
+      if `patchMap`[`nextPatchId`].anyIt(`patchSelfChanged`[`it`]):
         `patchCode`
         debugEcho "patched: ", `nextPatchId`
     inc nextPatchId
@@ -164,40 +230,40 @@ macro component*(componentName, body: untyped): untyped =
     case templ.kind
     of templTag:
       let name = templ.name
-      createBody.add: quote do:
+      createImpl.add: quote do:
         `node` = document.createElement(`name`)
 
       for attr, val in templ.attrs:
         case val.kind
         of valStr:
-          let text = val.text
-          createBody.add: quote do:
+          let text = val.str
+          createImpl.add: quote do:
             `node`.setAttr(`attr`, `text`)
 
         of valCode:
           let code = val.code.prefix("$")
           let setAttrCall = quote do:
             `node`.setAttr(`attr`, `code`)
-          createBody.add setAttrCall
-          addPatchContent(code, setAttrCall)
+          createImpl.add setAttrCall
+          addPatchSelfContent(code, setAttrCall)
 
       for event, code in templ.handlers:
-        createBody.add: quote do:
+        createImpl.add: quote do:
           `node`.addEventListener(`event`) do (_: Event):
-            `withPatching`(`code`)
+            `withPatchingTemplate`(`code`)
 
       let parentId = nodeId
       for child in templ.childs: generate(child, parentId)
 
     of templText:
-      createBody.add: quote do:
+      createImpl.add: quote do:
         `node` = document.createTextNode("")
       
       var hasCodeParts = false
       var parts: seq[NimNode] = collect:
         for val in templ.text:
           case val.kind
-          of valStr: newLit(val.text)
+          of valStr: newLit(val.str)
           of valCode:
             hasCodeParts = true
             val.code.prefix("$")
@@ -206,15 +272,15 @@ macro component*(componentName, body: untyped): untyped =
       let assignText = quote do:
         `node`.data = `buildText`
 
-      createBody.add assignText
+      createImpl.add assignText
       if hasCodeParts:
-        addPatchContent(buildText, assignText)
+        addPatchSelfContent(buildText, assignText)
 
-    else: discard  #TODO
+    else: return  #TODO
 
-    mountBody.add:
+    mountImpl.add:
       if parentId < 0:
-        detatchBody.add: quote do:
+        detatchImpl.add: quote do:
           `detatchParent`.removeChild(`node`)
         quote do:
           if `mountHook` == nil:
@@ -229,15 +295,19 @@ macro component*(componentName, body: untyped): untyped =
 
   let nodesCount = nodeId + 1
 
-  quote do:
-    let `componentName` = proc: Component =
+
+  # add proc body:
+  result = quote do:
+    proc: auto =
       var `nodesArray`: array[`nodesCount`, Node]
       var `patchSelf`: proc(changed: seq[bool]) = nil
       generatePatchHandling(`bodyForPatchGen`)
-      `createBody`
-      `patchSelf` = proc(`patchChanged`: seq[bool]) = `patchBody`
-      Component(
-        mount: proc(`mountParent`, `mountHook`: Node) = `mountBody`,
-        patch: `patchSelf`,
-        detatch: proc(`detatchParent`: Node) = `detatchBody`
+      `createImpl`
+      `patchSelf` = proc(`patchSelfChanged`: seq[bool]) = `patchSelfImpl`
+      newComponent(
+        proc(`mountParent`, `mountHook`: Node) = `mountImpl`,
+        `patchDef`,
+        proc(`detatchParent`: Node) = `detatchImpl`
       )
+
+  debugEcho repr result

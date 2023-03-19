@@ -6,7 +6,7 @@ type
   ValKind* = enum valStr, valCode
   Val* = object
     case kind*: ValKind
-    of valStr: text*: string
+    of valStr: str*: string
     of valCode: code*: NimNode
   
   Attrs* = Table[string, Val]
@@ -20,11 +20,14 @@ type
     case kind*: TemplElemKind
     of templText:
       text*: TemplText
-    of templTag, templComponent:
+    of templTag:
       name*: string
       attrs*: Attrs
       handlers*: Handlers
       childs*: seq[TemplElem]
+    of templComponent:
+      initCode*: NimNode
+      body*: seq[TemplElem]
 
   Templ* = seq[TemplElem]
 
@@ -36,16 +39,16 @@ func `$`*(elem: TemplElem): string =
     for val in elem.text:
       result.add:
         case val.kind
-        of valStr: val.text
+        of valStr: val.str
         of valCode: "{" & repr(val.code) & "}"
 
   of templTag:
-    result &= "<" & elem.name
+    result = "<" & elem.name
     for name, val in elem.attrs:
       result &= fmt " {name}="
       result.add:
         case val.kind
-        of valStr: '"' & val.text & '"'
+        of valStr: '"' & val.str & '"'
         of valCode: '{' & repr(val.code) & '}'
     for name, code in elem.handlers:
       result &= fmt" on:{name}={{{repr code}}}"
@@ -54,13 +57,14 @@ func `$`*(elem: TemplElem): string =
     else:
       result &= fmt">{elem.childs}</>"
 
-  else: discard
+  of templComponent:
+    result = "<{" & repr(elem.initCode) & "}/>"
 
 func `$`*(elems: Templ): string =
   for elem in elems:
     result &= $elem
 
-func newVal(s: string):  Val = Val(kind: valStr,  text: s)
+func newVal(s: string):  Val = Val(kind: valStr,  str: s)
 func newVal(n: NimNode): Val = Val(kind: valCode, code: n)
 
 func newAttrs:    Attrs    {.inline.} = discard
@@ -108,63 +112,74 @@ func parseTempl*(code: string): Templ =
     case code[i]
     of '<':
       inc i
-
-      result.kind = templTag
       skipSpaces()
-      i += code.parseUntil(result.name, {' ', '/', '>'}, i)
-      while true:
+
+      if code[i] == '{':
+        result.kind = templComponent
+        result.initCode = parseCodeBlock()
         skipSpaces()
-
-        if code[i] == '>':
-          inc i
-          break
-        if code[i] == '/':
-          inc i
-          skipSpaces()
-          assert code[i] == '>'
-          inc i
-          return
-
-        var name: string
-        i += code.parseUntil(name, '=', i)
-        name = strip(name)
+        assert code[i] == '/'
         inc i
         skipSpaces()
+        assert code[i] == '>'
+        inc i
 
-        let val =
-          case code[i]
-          of '{':
-            newVal(parseCodeBlock())
-          of '"':
+      else:
+        result.kind = templTag
+        i += code.parseUntil(result.name, {' ', '/', '>'}, i)
+        while true:
+          skipSpaces()
+
+          if code[i] == '>':
             inc i
-            var text: string
-            i += code.parseUntilEscaped(text, {'"'}, i)
+            break
+          if code[i] == '/':
             inc i
-            newVal(text)
+            skipSpaces()
+            assert code[i] == '>'
+            inc i
+            return
+
+          var name: string
+          i += code.parseUntil(name, '=', i)
+          name = strip(name)
+          inc i
+          skipSpaces()
+
+          let val =
+            case code[i]
+            of '{':
+              newVal(parseCodeBlock())
+            of '"':
+              inc i
+              var str: string
+              i += code.parseUntilEscaped(str, {'"'}, i)
+              inc i
+              newVal(str)
+            else:
+              assert false  #TODO: err msg
+              return
+
+          if name.startsWith("on:"):
+            assert val.kind == valCode  #TODO: err msg
+            result.handlers[name[3..^1]] = val.code
           else:
-            assert false  #TODO: err msg
-            return
+            result.attrs[name] = val
 
-        if name.startsWith("on:"):
-          assert val.kind == valCode  #TODO: err msg
-          result.handlers[name[3..^1]] = val.code
-        else:
-          result.attrs[name] = val
+        while true:
+          if code[i] == '<':
+            var j = i + 1
+            j += code.skipWhitespace(j)
+            if code[j] == '/':
+              i = j + 1
+              var name: string
+              i += code.parseUntil(name, '>', i)
+              inc i
+              name = strip(name)
+              assert name == "" or name == result.name  #TODO: err msg
+              return
 
-      while true:
-        if code[i] == '<':
-          var j = i + 1
-          j += code.skipWhitespace(j)
-          if code[j] == '/':
-            i = j + 1
-            var name: string
-            i += code.parseUntil(name, '>', i)
-            inc i
-            name = strip(name)
-            assert name == "" or name == result.name  #TODO: err msg
-            return
-
-        result.childs &= parseElem()
+          result.childs &= parseElem()
 
     else:
       result.kind = templText
