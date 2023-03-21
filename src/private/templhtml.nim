@@ -8,10 +8,6 @@ type
     case kind*: ValKind
     of valStr: str*: string
     of valCode: code*: NimNode
-  
-  Attrs* = Table[string, Val]
-
-  Handlers* = Table[string, NimNode]
 
   TemplText* = seq[Val]
 
@@ -22,11 +18,12 @@ type
       text*: TemplText
     of templTag:
       name*: string
-      attrs*: Attrs
-      handlers*: Handlers
+      attrs*: Table[string, Val]
+      handlers*: Table[string, NimNode]
       childs*: seq[TemplElem]
     of templComponent:
-      initCode*: NimNode
+      ident*: NimNode
+      vars*: Table[string, NimNode]
       body*: seq[TemplElem]
 
   Templ* = seq[TemplElem]
@@ -58,7 +55,10 @@ func `$`*(elem: TemplElem): string =
       result &= fmt">{elem.childs}</>"
 
   of templComponent:
-    result = "<{" & repr(elem.initCode) & "}/>"
+    result = "<{" & repr(elem.ident) & "}"
+    for name, val in elem.vars:
+      result &= fmt" {name}={{{repr val}}}"
+    result &= "/>"
 
 func `$`*(elems: Templ): string =
   for elem in elems:
@@ -66,9 +66,6 @@ func `$`*(elems: Templ): string =
 
 func newVal(s: string):  Val = Val(kind: valStr,  str: s)
 func newVal(n: NimNode): Val = Val(kind: valCode, code: n)
-
-func newAttrs:    Attrs    {.inline.} = discard
-func newHandlers: Handlers {.inline.} = discard
 
 
 func merge[T: Table](a, b: T): T =
@@ -91,7 +88,7 @@ func parseTempl*(code: string): Templ =
   proc skipSpaces =
     i += code.skipWhitespace(i)
 
-  proc parseCodeBlock: NimNode =
+  proc parseCodeBlock(asBlock = true): NimNode =
     assert code[i] == '{'
     inc i
     let start = i
@@ -102,9 +99,12 @@ func parseTempl*(code: string): Templ =
       of '}': dec nestingDepth
       else: discard
       inc i
-    nnkBlockStmt.newTree(newEmptyNode(),
-      newStmtList(parseStmt(code[start ..< i-1].dedent))
-    )
+    let codeStr = code[start ..< i-1].dedent
+    if asBlock:
+      nnkBlockStmt.newTree(newEmptyNode(),
+        newStmtList(parseStmt(codeStr))
+      )
+    else: parseExpr(codeStr)
 
 
   proc parseElem: TemplElem =
@@ -116,13 +116,23 @@ func parseTempl*(code: string): Templ =
 
       if code[i] == '{':
         result.kind = templComponent
-        result.initCode = parseCodeBlock()
-        skipSpaces()
-        assert code[i] == '/'
-        inc i
-        skipSpaces()
-        assert code[i] == '>'
-        inc i
+        result.ident = parseCodeBlock(false)
+        while true:
+          skipSpaces()
+
+          if code[i] == '/':
+            inc i
+            skipSpaces()
+            assert code[i] == '>'
+            inc i
+            return
+          
+          var name: string
+          i += code.parseUntil(name, '=', i)
+          name = strip(name)
+          inc i
+          skipSpaces()
+          result.vars[name] = parseCodeBlock()
 
       else:
         result.kind = templTag

@@ -12,18 +12,22 @@ let testComponent = component:
   var i = 2
   var j* = 3
 
-  proc countUp =
+  proc countUpI =
     inc i
 
   templ"""
     <div>
-      <h1 on:click={countUp()}>i = {i}</>
-      <span color="red">j = {j}</span>
+      <h1>i = {i}</>
+      <button on:click={countUpI()}>increment i</>
+      <button on:click={j += 2}>increment j by 2</><br/>
+      <span color="red">j = {j}</span><br/>
+      i + j = <{boldNum} n = {i+j}/>
     </div>
   """
 
 
-let c = testComponent()
+debugEcho testComponent.exportedVars
+let c = testComponent.create()
 c.mount(document.body, nil)
-discard setTimeout(proc = c.patch(4, [true]), 1000)
+discard setTimeout(proc = c.patch((4,), @[true]), 1000)
 #discard setTimeout(proc = c.detatch(document.body), 1000)
