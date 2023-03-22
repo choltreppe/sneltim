@@ -13,31 +13,30 @@ type
   Component*[T: tuple, exportedVars: static seq[string]] = object
     create*: proc: ComponentInstance[T]
 
+  MemberDef = object
+    mutable: bool
+    exported: bool
+    sym, T, val: NimNode
+
+  TemplElemInfo = tuple[templ: TemplElem, sym, parent: NimNode]
+
 
 let
-  memberVarsCount {.compiletime.} = ident"sneltimMembersCount"
-  patchMap {.compiletime.} = ident"sneltimPatchMap"
-  exportedVarMap {.compiletime.} = ident"sneltimExportMap"
-  exportedVarLabel {.compiletime.} = genSym(nskLabel, "exportVar")
+  dynamicContentLabel {.compiletime.} = genSym(nskLabel, "dynamicContent")
+  patchTable {.compiletime.} = ident"sneltimPatchTable"
   withPatchingTemplate {.compiletime.} = ident"sneltimWithPatching"
   patchSelf {.compiletime.} = ident"sneltimPatchSelf"
-
-
-# just a container for recognition in typed macro
-proc dynamicContent[T](v: T) = discard
 
 func `=~=`(a,b: string): bool = cmpIgnoreStyle(a, b) == 0
 
 
-macro generatePatchHandling(body: typed): untyped =
+macro collectPatchTable(body: typed): untyped =
   result = newStmtList()
 
   var
     memberVars: seq[NimNode]
-
     memberProcs: seq[NimNode]
     memberProcRefs: seq[seq[int]]   # procId  ->  referenced memberIds
-
     contentRefs: seq[seq[int]]   # contentId  ->  referenced memberIds
 
   proc findMemberRefs(node: NimNode): seq[int] =
@@ -55,12 +54,9 @@ macro generatePatchHandling(body: typed): untyped =
 
     else: discard
 
-
   let body =
     if body.kind in {nnkStmtList, nnkStmtListExpr}: body
     else: newStmtList(body)
-
-  var exportedVarMapImpl = nnkBracket.newTree()
 
   for stmt in body:
     case stmt.kind
@@ -68,39 +64,26 @@ macro generatePatchHandling(body: typed): untyped =
       result.add stmt
       for def in stmt:
         memberVars.add def[0]
-        if def[2].kind in {nnkBlockStmt, nnkBlockExpr} and def[2][0] == exportedVarLabel:
-          exportedVarMapImpl.add newLit(high(memberVars))
 
     of nnkProcDef, nnkFuncDef:
       result.add stmt
       memberProcRefs &= (findMemberRefs(stmt[3]) & findMemberRefs(stmt[6])).deduplicate
       memberProcs &= stmt[0]
 
-    of nnkCall, nnkCommand:
-      if stmt[0].kind == nnkSym and $stmt[0] =~= "dynamicContent":
+    of nnkBlockStmt, nnkBlockExpr:
+      if stmt[0].kind == nnkSym and stmt[0] == dynamicContentLabel:
         stmt.expectLen 2
         contentRefs &= findMemberRefs(stmt[1])
+      
+      else: result.add stmt
+    else: result.add stmt
 
-    else:
-      result.add stmt
-
-
-  result.add: quote do:
-    const `exportedVarMap`: seq[int] = @`exportedVarMapImpl`
-
-
-  let l = len(memberVars)
-  result.add: quote do:
-    const `memberVarsCount` = `l`
-
-
-  var patchMapImpl = nnkBracket.newTree()  # patchId  ->  memberIds
+  var patchTableImpl = nnkBracket.newTree()  # patchId  ->  memberIds
   for patchId, memberIds in contentRefs:
-    patchMapImpl.add: quote do: @`memberIds`
+    patchTableImpl.add: quote do: @`memberIds`
 
   result.add quote do:
-    const `patchMap`: seq[seq[int]] = @`patchMapImpl`
-
+    const `patchTable`: seq[seq[int]] = @`patchTableImpl`
 
   let withPatchingParam = genSym(nskParam, "body")
   let withPatchingImpl = block:
@@ -134,179 +117,138 @@ macro getExportedVarId*[T: tuple, exportedVars: static seq[string]](_: Component
   newLit(i)
 
 
-
-macro component*(body: untyped): untyped =
-  body.expectKind nnkStmtList
-
-  let
-    nodesArray = genSym(nskVar, "nodes")
-    mountParent = genSym(nskParam, "parent")
-    mountHook = genSym(nskParam, "hook")
-    patchSelfChanged = genSym(nskParam, "changed")
-    patchVals = genSym(nskParam, "vals")
-    patchChanged = genSym(nskParam, "changed")
-    detatchParent = genSym(nskParam, "parent")
-
-  var
-    initElems = newStmtList()
-    mountImpl = newStmtList()
-    patchSelfImpl = newStmtList()
-    patchImpl = newStmtList()
-    detatchImpl = newStmtList()
-    T = nnkTupleConstr.newTree()
+func getExportedVarNames(defs: seq[MemberDef]): seq[string] =
+  for def in defs:
+    if def.exported:
+      result &= $def.sym
 
 
-  var templStr = ""
-  var bodyForPatchGen = newStmtList()
-  var exportedVars: seq[string]
-  let patchChangedMembers = genSym(nskVar, "changedMembers")
-
-  patchImpl.add: quote do:
-    var `patchChangedMembers` = newSeq[bool](`memberVarsCount`)
-
-  for stmt in body:
-    if stmt.kind in {nnkCommand, nnkCall, nnkCallStrLit} and
-       stmt[0].strVal =~= "templ":
-          stmt.expectLen 2
-          assert templStr == ""
-          templStr = stmt[1].strVal
-
-    elif stmt.kind == nnkVarSection:
-      var varDefs = nnkVarSection.newTree()
-      for def in stmt:
-        if def[0].kind == nnkPostfix and $def[0][0] == "*":
-          let memberVar = def[0][1]
-          let td = def[1]
-          let body = def[2]
-          exportedVars &= $memberVar
-          let i = high(exportedVars)
-          T.add:
-            if td.kind == nnkEmpty: newCall(ident"typeof", body)
-            else: td
-          patchImpl.add: quote do:
-            if `patchChanged`[`i`]:
-              `memberVar` = `patchVals`[`i`]
-              `patchChangedMembers`[`exportedVarMap`[`i`]] = true
-          varDefs.add nnkIdentDefs.newTree(
-            memberVar,
-            td,
-            nnkBlockStmt.newTree(exportedVarLabel,
-              if body.kind == nnkEmpty:
-                quote do: default(`td`)
-              else: body
-            )
-          )
-        else:
-          varDefs.add def
-      bodyForPatchGen.add varDefs
-
-    else:
-      bodyForPatchGen.add stmt
-
-  assert templStr != ""
-  let templ = parseTempl(templStr)
-
-
-  patchImpl.add: quote do:
-    `patchSelf`(`patchChangedMembers`)
-
-  let patchDef = quote do:
-    proc(`patchVals`: `T`, `patchChanged`: seq[bool]) =
-      `patchImpl`
-
-
-  var
-    nodeId = -1
-    nextPatchId = 0  
-
-  proc addPatchSelfContent(anylizeCode, patchCode: NimNode) =
-    bodyForPatchGen.add quote do:
-      dynamicContent(`anylizeCode`)
-    let it = ident"it"
-    patchSelfImpl.add: quote do:
-      if `patchMap`[`nextPatchId`].anyIt(`patchSelfChanged`[`it`]):
-        `patchCode`
-    inc nextPatchId
-
-  # build all procs and init
-  proc generate(templ: TemplElem, parentNode = newEmptyNode()) =
-    let elem = genSym(nskLet, "elem")
-
+func buildElemsInit(elems: seq[TemplElemInfo]): NimNode =
+  result = newStmtList()
+  for (templ, sym, _) in elems:
     case templ.kind
     of templTag:
       let name = templ.name
-      initElems.add: quote do:
-        let `elem` = document.createElement(`name`)
+      result.add: quote do:
+        let `sym` = document.createElement(`name`)
 
       for attr, val in templ.attrs:
         case val.kind
         of valStr:
           let text = val.str
-          initElems.add: quote do:
-            `elem`.setAttr(`attr`, `text`)
+          result.add: quote do:
+            `sym`.setAttr(`attr`, `text`)
 
         of valCode:
           let code = val.code.prefix("$")
-          let setAttrCall = quote do:
-            `elem`.setAttr(`attr`, `code`)
-          initElems.add setAttrCall
-          addPatchSelfContent(code): quote do:
-            `setAttrCall`
-            debugEcho "patched: ", `nextPatchId`
+          result.add: quote do:
+            `sym`.setAttr(`attr`, `code`)
 
       for event, code in templ.handlers:
-        initElems.add: quote do:
-          `elem`.addEventListener(`event`) do (_: Event):
+        result.add: quote do:
+          `sym`.addEventListener(`event`) do (_: Event):
             `withPatchingTemplate`(`code`)
 
-      for child in templ.childs: generate(child, elem)
-
     of templComponent:
-      let component = templ.ident
-      # init:
-      block:
-        let vals = genSym(nskVar, "vals")
-        let changed = genSym(nskVar, "changed")
-        initElems.add: quote do:
-          let `elem` = `component`.create()
-          var `vals`: `component`.T
-          var `changed` = newSeq[bool](len(`component`.exportedVars))
-        for name, valCode in templ.vars:
-          initElems.add: quote do:
-            `vals`[`component`.getExportedVarId(`name`)] = `valCode`
-            `changed`[`component`.getExportedVarId(`name`)] = true
-        initElems.add: quote do:
-          `elem`.patch(`vals`, `changed`)
-      # patch:
-      block:
-        let vals = genSym(nskVar, "vals")
-        let changed = genSym(nskVar, "changed")
-        let anyChanges = genSym(nskVar, "anyChanges")
-        patchSelfImpl.add: quote do:
-          var `vals`: `component`.T
-          var `changed` = newSeq[bool](len(`component`.exportedVars))
-          var `anyChanges` = false
-        for name, valCode in templ.vars:
-          addPatchSelfContent(valCode): quote do:
-            `vals`[`component`.getExportedVarId(`name`)] = `valCode`
-            `changed`[`component`.getExportedVarId(`name`)] = true
-            `anyChanges` = true
-        let componentName = $component  # just for debug output
-        patchSelfImpl.add: quote do:
-          if `anyChanges`:
-            debugEcho "enter patching of ", `componentName`, ":"
-            `elem`.patch(`vals`, `changed`)
-      # mount, detatch:
-      mountImpl.add:
-        if parentNode.kind == nnkEmpty:
-          detatchImpl.add: quote do:
-            `elem`.detatch(`detatchParent`)
+      let component = templ.sym
+      let vals = genSym(nskVar, "vals")
+      let defined = genSym(nskVar, "defined")
+      result.add: quote do:
+        let `sym` = `component`.create()
+        var `vals`: `component`.T
+        var `defined` = newSeq[bool](len(`component`.exportedVars))
+      for name, valCode in templ.vars:
+        result.add: quote do:
+          `vals`[`component`.getExportedVarId(`name`)] = `valCode`
+          `defined`[`component`.getExportedVarId(`name`)] = true
+      result.add: quote do:
+        `sym`.patch(`vals`, `defined`)
+
+    of templText:
+      var parts: seq[NimNode] = collect:
+        for val in templ.text:
+          case val.kind
+          of valStr: newLit(val.str)
+          of valCode:
+            val.code.prefix("$")
+
+      let buildText = parts.foldl(infix(a, "&", b))
+
+      result.add: quote do:
+        let `sym` = document.createTextNode(`buildText`)
+
+
+func buildMountProc(elems: seq[TemplElemInfo]): NimNode =
+  var procBody = newStmtList()
+
+  let
+    rootParent = genSym(nskParam, "parent")
+    rootHook = genSym(nskParam, "hook")
+
+  for (templ, sym, parent) in elems:
+    procBody.add:
+      if templ.kind == templComponent:
+        if parent == nil:
           quote do:
-            `elem`.mount(`mountParent`, `mountHook`)
+            `sym`.mount(`rootParent`, `rootHook`)
         else:
           quote do:
-            `elem`.mount(`parentNode`, nil)
-      return  # to skip default mount/detatch
+            `sym`.mount(`parent`, nil)
+      else:
+        if parent == nil:
+          quote do:
+            if `rootHook` == nil:
+              `rootParent`.appendChild(`sym`)
+            else:
+              `rootParent`.insertBefore(`sym`, `rootHook`)
+        else:
+          quote do:
+            `parent`.appendChild(`sym`)
+
+  quote do:
+    proc(`rootParent`, `rootHook`: Node) = `procBody`
+
+
+func buildPatchSelfProc(elems: seq[TemplElemInfo]): tuple[procDef: NimNode, anylizeCodes: seq[NimNode]] =
+  var procBody = newStmtList()
+  var anylizeCodes: seq[NimNode]
+
+  let changed = genSym(nskParam, "changed")
+
+  proc addContent(anylizeCode, patchCode: NimNode) =
+    anylizeCodes.add anylizeCode
+    let patchId = high(anylizeCodes)
+    let it = ident"it"
+    procBody.add: quote do:
+      if `patchTable`[`patchId`].anyIt(`changed`[`it`]):
+        `patchCode`
+
+  for (templ, sym, parent) in elems:
+    case templ.kind
+    of templTag:
+      for attr, val in templ.attrs:
+        if val.kind == valCode:
+          let code = val.code
+          addContent(code): quote do:
+            `sym`.setAttr(`attr`, $`code`)
+
+    of templComponent:
+      let component = templ.sym
+      let vals = genSym(nskVar, "vals")
+      let changed = genSym(nskVar, "changed")
+      let anyChanges = genSym(nskVar, "anyChanges")
+      procBody.add: quote do:
+        var `vals`: `component`.T
+        var `changed` = newSeq[bool](len(`component`.exportedVars))
+        var `anyChanges` = false
+      for name, valCode in templ.vars:
+        addContent(valCode): quote do:
+          `vals`[`component`.getExportedVarId(`name`)] = `valCode`
+          `changed`[`component`.getExportedVarId(`name`)] = true
+          `anyChanges` = true
+      procBody.add: quote do:
+        if `anyChanges`:
+          `sym`.patch(`vals`, `changed`)
 
     of templText:
       var hasCodeParts = false
@@ -319,49 +261,158 @@ macro component*(body: untyped): untyped =
             val.code.prefix("$")
 
       let buildText = parts.foldl(infix(a, "&", b))
-      let assignText = quote do:
-        `elem`.data = `buildText`
-
-      initElems.add: quote do:
-        let `elem` = document.createTextNode(`buildText`)
 
       if hasCodeParts:
-        addPatchSelfContent(buildText): quote do:
-          `assignText`
-          debugEcho "patched: ", `nextPatchId`
+        addContent(buildText): quote do:
+          `sym`.data = `buildText`
 
-    mountImpl.add:
-      if parentNode.kind == nnkEmpty:
-        # just need to detatch root elems
-        detatchImpl.add: quote do:
-          `detatchParent`.removeChild(`elem`)
-        quote do:
-          if `mountHook` == nil:
-            `mountParent`.appendChild(`elem`)
-          else:
-            `mountParent`.insertBefore(`elem`, `mountHook`)
+  result.procDef = quote do:
+    proc(`changed`: seq[bool]) = `procBody`
+
+  result.anylizeCodes = anylizeCodes
+
+
+func buildPatchProc(defs: seq[MemberDef]): tuple[procDef, paramType: NimNode] =
+  var procBody = newStmtList()
+  var T = nnkTupleConstr.newTree()
+  
+  let
+    vals = genSym(nskParam, "vals")
+    changed = genSym(nskParam, "changed")
+    changedMembers = genSym(nskVar, "changedMembers")
+
+  procBody.add newEmptyNode()  # to insert `changedMembers` decl
+
+  var exportedId = 0
+  var memberId = 0
+  for def in defs:
+    if def.exported:
+      T.add:
+        if def.T.kind == nnkEmpty: newCall(ident"typeof", def.val)
+        else: def.T
+      let sym = def.sym
+      procBody.add: quote do:
+        if `changed`[`exportedId`]:
+          `sym` = `vals`[`exportedId`]
+          `changedMembers`[`memberId`] = true
+      inc exportedId
+
+    if def.mutable or def.exported:
+      inc memberId
+  
+  procBody[0] = quote do:
+    var `changedMembers` = newSeq[bool](`memberId`)
+
+  procBody.add: quote do:
+    `patchSelf`(`changedMembers`)
+
+  result.procDef = quote do:
+    proc(`vals`: `T`, `changed`: seq[bool]) = `procBody`
+
+  result.paramType = T
+
+
+func buildDetatchProc(elems: seq[TemplElemInfo]): NimNode =
+  var procBody = newStmtList()
+  let rootParent = genSym(nskParam, "parent")
+  for (templ, sym, parent) in elems:
+    if parent == nil:
+      procBody.add:
+        if templ.kind == templComponent:
+          quote do:
+            `sym`.detatch(`rootParent`)
+        else:
+          quote do:
+            `rootParent`.removeChild(`sym`)
+  quote do:
+    proc(`rootParent`: Node) = `procBody`
+
+
+proc buildInitAndPatchTable(defs: seq[MemberDef], code: NimNode, anylizeCodes: seq[NimNode]): NimNode =
+  var body = newStmtList()
+
+  for def in defs:
+    let identDef = nnkIdentDefs.newTree(def.sym, def.T, def.val)
+    body.add:
+      if def.mutable: nnkVarSection.newTree(identDef)
+      else:           nnkLetSection.newTree(identDef)
+
+  body.add code
+
+  for code in anylizeCodes:
+    body.add: quote do:
+      block `dynamicContentLabel`:
+        discard `code`
+
+  quote do:
+    collectPatchTable(`body`)
+
+
+macro component*(body: untyped): untyped =
+  body.expectKind nnkStmtList
+
+  var memberDefs: seq[MemberDef]
+  var templStr = ""
+  var code = newStmtList()  # code thats neither member defs nor template def
+
+  for stmt in body:
+    block checkStmt:
+      if stmt.kind in {nnkCommand, nnkCall, nnkCallStrLit} and
+         stmt[0].strVal =~= "templ":
+            stmt.expectLen 2
+            assert templStr == ""
+            templStr = stmt[1].strVal
       else:
-        quote do:
-          `parentNode`.appendChild(`elem`)
+        for (kind, mutable) in [(nnkLetSection, false), (nnkVarSection, true)]:
+          if stmt.kind == kind:
+            for def in stmt:
+              memberDefs.add:
+                if def[0].kind == nnkPostfix and $def[0][0] == "*":
+                  MemberDef(
+                    mutable: mutable, exported: true,
+                    sym: def[0][1], T: def[1], val: def[2]
+                  )
+                else:
+                  MemberDef(
+                    mutable: mutable, exported: false,
+                    sym: def[0], T: def[1], val: def[2]
+                  )
+            break checkStmt
+        code.add stmt
 
-  for templ in templ:
-    generate(templ)
+  assert templStr != ""
+  let templ = parseTempl(templStr)
 
-  let nodesCount = nodeId + 1
+  var templElemsInfo: seq[TemplElemInfo]
+  proc collectTemplElemInfo(elem: TemplElem, parent: NimNode = nil) =
+    let sym = genSym(nskLet, "elem")
+    templElemsInfo &= (elem, sym, parent)
+    if elem.kind == templTag:
+      for child in elem.childs:
+        collectTemplElemInfo(child, sym)
+  for elem in templ:
+    collectTemplElemInfo(elem)
 
+  let
+    exportedVars = getExportedVarNames(memberDefs)
+    initElems = buildElemsInit(templElemsInfo)
+    mountProc = buildMountProc(templElemsInfo)
+    (patchSelfProc, anylizeCodes) = buildPatchSelfProc(templElemsInfo)
+    (patchProc, T) = buildPatchProc(memberDefs)
+    detatchProc = buildDetatchProc(templElemsInfo)
+    init = buildInitAndPatchTable(memberDefs, code, anylizeCodes)
 
-  # add proc body:
   result = quote do:
     Component[`T`, @`exportedVars`](
       create: proc: ComponentInstance[`T`] =
         var `patchSelf`: proc(changed: seq[bool]) = nil
-        generatePatchHandling(`bodyForPatchGen`)
+        `init`
         `initElems`
-        `patchSelf` = proc(`patchSelfChanged`: seq[bool]) = `patchSelfImpl`
+        `patchSelf` = `patchSelfProc`
         ComponentInstance[`T`](
-          mount: proc(`mountParent`, `mountHook`: Node) = `mountImpl`,
-          patch: `patchDef`,
-          detatch: proc(`detatchParent`: Node) = `detatchImpl`
+          mount: `mountProc`,
+          patch: `patchProc`,
+          detatch: `detatchProc`
         )
     )
 

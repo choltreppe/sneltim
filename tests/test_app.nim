@@ -20,7 +20,7 @@ let testComponent = component:
       <h1>i = {i}</>
       <button on:click={countUpI()}>increment i</>
       <button on:click={j += 2}>increment j by 2</><br/>
-      <span color="red">j = {j}</span><br/>
+      <span>j = <{boldNum} n = {j}/></span><br/>
       i + j = <{boldNum} n = {i+j}/>
     </div>
   """

@@ -22,7 +22,7 @@ type
       handlers*: Table[string, NimNode]
       childs*: seq[TemplElem]
     of templComponent:
-      ident*: NimNode
+      sym*: NimNode
       vars*: Table[string, NimNode]
       body*: seq[TemplElem]
 
@@ -55,7 +55,7 @@ func `$`*(elem: TemplElem): string =
       result &= fmt">{elem.childs}</>"
 
   of templComponent:
-    result = "<{" & repr(elem.ident) & "}"
+    result = "<{" & repr(elem.sym) & "}"
     for name, val in elem.vars:
       result &= fmt" {name}={{{repr val}}}"
     result &= "/>"
@@ -116,7 +116,7 @@ func parseTempl*(code: string): Templ =
 
       if code[i] == '{':
         result.kind = templComponent
-        result.ident = parseCodeBlock(false)
+        result.sym = parseCodeBlock(false)
         while true:
           skipSpaces()
 
