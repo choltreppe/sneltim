@@ -17,12 +17,12 @@ type
     of templText:
       text*: TemplText
     of templTag:
-      name*: string
+      tag*: string
       attrs*: Table[string, Val]
       handlers*: Table[string, NimNode]
       childs*: seq[TemplElem]
     of templComponent:
-      sym*: NimNode
+      component*: NimNode
       vars*: Table[string, NimNode]
       body*: seq[TemplElem]
 
@@ -40,7 +40,7 @@ func `$`*(elem: TemplElem): string =
         of valCode: "{" & repr(val.code) & "}"
 
   of templTag:
-    result = "<" & elem.name
+    result = "<" & elem.tag
     for name, val in elem.attrs:
       result &= fmt " {name}="
       result.add:
@@ -55,7 +55,7 @@ func `$`*(elem: TemplElem): string =
       result &= fmt">{elem.childs}</>"
 
   of templComponent:
-    result = "<{" & repr(elem.sym) & "}"
+    result = "<{" & repr(elem.component) & "}"
     for name, val in elem.vars:
       result &= fmt" {name}={{{repr val}}}"
     result &= "/>"
@@ -116,7 +116,7 @@ func parseTempl*(code: string): Templ =
 
       if code[i] == '{':
         result.kind = templComponent
-        result.sym = parseCodeBlock(false)
+        result.component = parseCodeBlock(false)
         while true:
           skipSpaces()
 
@@ -132,11 +132,11 @@ func parseTempl*(code: string): Templ =
           name = strip(name)
           inc i
           skipSpaces()
-          result.vars[name] = parseCodeBlock()
+          result.vars[name] = parseCodeBlock(false)
 
       else:
         result.kind = templTag
-        i += code.parseUntil(result.name, {' ', '/', '>'}, i)
+        i += code.parseUntil(result.tag, {' ', '/', '>'}, i)
         while true:
           skipSpaces()
 
@@ -182,11 +182,11 @@ func parseTempl*(code: string): Templ =
             j += code.skipWhitespace(j)
             if code[j] == '/':
               i = j + 1
-              var name: string
-              i += code.parseUntil(name, '>', i)
+              var tag: string
+              i += code.parseUntil(tag, '>', i)
               inc i
-              name = strip(name)
-              assert name == "" or name == result.name  #TODO: err msg
+              tag = strip(tag)
+              assert tag == "" or tag == result.tag  #TODO: err msg
               return
 
           result.childs &= parseElem()

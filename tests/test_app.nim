@@ -1,33 +1,35 @@
 import std/macros
-import sneltim
+import sneltim {.all.}
 
 
-let boldNum = component:
-  var n*: int
+let editableNum = component:
+  let title* = ""  # this is a public let member (it can only be set (and changed) from parent)
+  var value*: int  # this is a public var member (it can be set from parent and self, and chnages from self effect parent)
 
-  templ"<b>{n}</b>"
+  templ"""
+    {title}:
+    <button on:click={dec value}>-</>
+    {value}
+    <button on:click={inc value}>+</>
+  """
 
 
 let testComponent = component:
-  var i = 2
-  var j* = 3
+  var i = 2  # this is a private member (its not visible to parent)
+  var j = 3
 
   proc countUpI =
     inc i
 
   templ"""
     <div>
-      <h1>i = {i}</>
-      <button on:click={countUpI()}>increment i</>
-      <button on:click={j += 2}>increment j by 2</><br/>
-      <span>j = <{boldNum} n = {j}/></span><br/>
-      i + j = <{boldNum} n = {i+j}/>
+      <{editableNum} title={"edit i"} value={i}/><br/>
+      <{editableNum} title={"edit j"} value={j}/><br/>
+      i + j = {i+j}
     </div>
   """
 
 
-debugEcho testComponent.exportedVars
-let c = testComponent.create()
+let c = testComponent.create(nil)
 c.mount(document.body, nil)
-discard setTimeout(proc = c.patch((4,), @[true]), 1000)
 #discard setTimeout(proc = c.detatch(document.body), 1000)
