@@ -1,3 +1,12 @@
+#
+#    Sneltim - A svelte-like web-frontend framework for nim
+#        (c) Copyright 2023 Joel Lienhard
+#
+#    See the file "LICENSE.txt", included in this
+#    distribution, for details about the copyright.
+#
+
+
 import std/[macros, genasts, typetraits, sugar, sequtils, strutils, setutils, sets, tables, dom]
 export sets, tables, dom, sequtils
 
