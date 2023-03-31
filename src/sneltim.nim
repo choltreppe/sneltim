@@ -4,9 +4,6 @@ export sets, tables, dom, sequtils
 import ./private/templhtml
 
 
-func `=~=`(a,b: string): bool = cmpIgnoreStyle(a, b) == 0
-
-
 type
   Updates*[T: tuple] = object
     vals: T
@@ -30,35 +27,119 @@ type
   MemberTypes = array[MemberKind, NimNode]
 
   CodeBlockId = int
-
-  TemplElemFlat = ref object
-    sym: NimNode
-    case kind: TemplElemKind
-    of templText:
-      text: CodeBlockId
-    of templTag:
-      tag: string
-      attrs: Table[string, CodeBlockId]
-      handlers: Table[string, CodeBlockId]
-    of templComponent:
-      component: CodeBlockId
-      pubMembers: array[pubLet..pubVar, seq[string]]
-      vars: Table[string, CodeBlockId]
-    parentId: int
-  TemplFlat = seq[TemplElemFlat]
-
   CodeBlock = tuple
     code: NimNode
     refs: array[MemberKind, seq[int]]
 
+  TemplElemFlat[T: CodeBlock|CodeBlockId] = object
+    sym: NimNode
+    case kind: TemplElemKind
+    of templText:
+      text: T
+    of templTag:
+      tag: string
+      attrs: Table[string, T]
+      handlers: Table[string, T]
+    of templComponent:
+      component: T
+      pubMembers: array[pubLet..pubVar, seq[string]]
+      vars: Table[string, T]
+    of templFor:
+      forHead: T
+      forBody: string
+      forComponent: NimNode
+      forPubMembers: array[pubLet..pubVar, NimNode]
+      forPubMemberTypes: array[pubLet..pubVar, NimNode]
+    parentId: int
+    hookId: int = -1
 
+  TemplFlat[T: CodeBlock|CodeBlockId] = seq[TemplElemFlat[T]]
+  
+
+# just a marker for compilation
 func templCodeBlock(code: auto) = discard
 
 
+func `=~=`(a,b: string): bool = cmpIgnoreStyle(a, b) == 0
+
+proc setAttrProperly(node: Node, attr,val: string) =
+  case attr
+  of "value": node.value = val
+  else: node.setAttr(attr, val)
+
+
+func unbind(node: NimNode): NimNode =
+  case node.kind
+  of nnkSym:
+    result = ident($node)
+  of nnkHiddenAddr, nnkHiddenDeref:
+    result = unbind(node[0])
+  of nnkHiddenStdConv:
+    result = unbind(node[1])
+  of AtomicNodes - {nnkSym}:
+    result = node
+  else:
+    result = node.kind.newTree()
+    for node in node:
+      result.add unbind(node)
+
+func getForVars(forStmt: NimNode): seq[NimNode] =
+  assert forStmt.kind == nnkForStmt
+  for node in forStmt[0 ..< ^2]:
+    if node.kind == nnkVarTuple:
+      for sym in node: result.add sym
+    else: result.add node
+
+proc reactToChanges(
+  code: NimNode,
+  members: Members,
+  patch, updateParent: NimNode
+): NimNode =
+
+  let
+    privAnyChanges = genSym(nskVar, "privAnyChanges")
+    pubVarAnyChanges = genSym(nskVar, "pubVarAnyChanges")
+    privChanged = genSym(nskVar, "privChanged")
+    pubVarChanged = genSym(nskVar, "pubVarChanged")
+  var
+    pubVarVals = nnkTupleConstr.newTree()
+    safeOldState = newStmtList()
+    checkChanges = newStmtList(quote do:
+      var
+        `privChanged`: seq[bool]
+        `pubVarChanged`: seq[bool]
+        `privAnyChanges` = false
+        `pubVarAnyChanges` = false
+    )
+
+  for (kind, changed, anyChanges) in [(priv, privChanged, privAnyChanges), (pubVar, pubVarChanged, pubVarAnyChanges)]:
+    for i, name in members[kind]:
+      let memberSym = ident(name)
+      let backupSym = genSym(nskLet, "backup")
+      safeOldState.add: quote do:
+        let `backupSym` = `memberSym`
+      checkChanges.add: quote do:
+        `changed` &= `memberSym` != `backupSym`
+        `anyChanges` = `anyChanges` or `changed`[^1]
+  for name in members[pubVar]:
+    pubVarVals.add ident(name)
+  
+  let
+    pubVarLen = len(members[pubVar])
+    pubLetLen = len(members[pubLet])
+  quote do:
+    `safeOldState`
+    `code`
+    `checkChanges`
+    if `privAnyChanges` or `pubVarAnyChanges`:
+      `patch`([`privChanged`, newSeq[bool](`pubLetLen`), newSeq[bool](`pubVarLen`)])
+    if `pubVarAnyChanges`:
+      `updateParent`(newUpdates(`pubVarVals`, `pubVarChanged`))
+
+# to unify otherwise redundant code between initElems and patch
 proc buildComponentUpdate(
-  elem: TemplElemFlat,
-  codeBlocks: seq[CodeBlock],
-  changedCond: proc(valId: int): NimNode
+  elem: TemplElemFlat[CodeBlock],
+  changedCond: proc(refs: array[MemberKind, seq[int]]): NimNode
 ): NimNode =
 
   assert elem.kind == templComponent
@@ -83,9 +164,9 @@ proc buildComponentUpdate(
   for (kind, changed, vals, typeName) in [(pubLet, pubLetChanged, pubLetVals, "L"), (pubVar, pubVarChanged, pubVarVals, "V")]:
     for i, name in elem.pubMembers[kind]:
       if name in elem.vars:
-        let valId = elem.vars[name]
-        vals.add codeBlocks[valId].code
-        let varChanged = changedCond(valId)
+        let val = elem.vars[name]
+        vals.add val.code
+        let varChanged = changedCond(val.refs)
         result.add: quote do:
           `changed` &= `varChanged`
       else:
@@ -101,54 +182,58 @@ proc buildComponentUpdate(
       newUpdates(`pubVarVals`, `pubVarChanged`)
     )
 
-
-proc buildElemsInit(
-  templ: TemplFlat,
-  codeBlocks: seq[CodeBlock],
+func buildCreateForInstance(
+  elem: TemplElemFlat[CodeBlock],
   members: Members,
   patch, updateParent: NimNode
 ): NimNode =
 
-  proc reactToChanges(code: NimNode): NimNode =
-    let
-      privAnyChanges = genSym(nskVar, "privAnyChanges")
-      pubVarAnyChanges = genSym(nskVar, "pubVarAnyChanges")
-      privChanged = genSym(nskVar, "privChanged")
-      pubVarChanged = genSym(nskVar, "pubVarChanged")
-    var
-      pubVarVals = nnkTupleConstr.newTree()
-      safeOldState = newStmtList()
-      checkChanges = newStmtList(quote do:
-        var
-          `privChanged`: seq[bool]
-          `pubVarChanged`: seq[bool]
-          `privAnyChanges` = false
-          `pubVarAnyChanges` = false
-      )
+  let
+    sym = elem.sym
+    forComponent = elem.forComponent
+    pubLetVals = elem.forPubMembers[pubLet]
+    pubVarVals = elem.forPubMembers[pubVar]
+    PubVarType = elem.forPubMemberTypes[pubVar]
+    parentUpdates = genSym(nskParam, "parentUpdates")
 
-    for (kind, changed, anyChanges) in [(priv, privChanged, privAnyChanges), (pubVar, pubVarChanged, pubVarAnyChanges)]:
-      for i, name in members[kind]:
-        let memberSym = ident(name)
-        let backupSym = genSym(nskLet, "backup")
-        safeOldState.add: quote do:
-          let `backupSym` = `memberSym`
-        checkChanges.add: quote do:
-          `changed` &= `memberSym` != `backupSym`
-          `anyChanges` = `anyChanges` or `changed`[^1]
-    for name in members[pubVar]:
-      pubVarVals.add ident(name)
-    
-    let
-      pubVarLen = len(members[pubVar])
-      pubLetLen = len(members[pubLet])
-    quote do:
-      `safeOldState`
-      `code`
-      `checkChanges`
-      if `privAnyChanges` or `pubVarAnyChanges`:
-        `patch`([`privChanged`, newSeq[bool](`pubLetLen`), newSeq[bool](`pubVarLen`)])
-      if `pubVarAnyChanges`:
-        `updateParent`(newUpdates(`pubVarVals`, `pubVarChanged`))
+  var updateParentBody = newStmtList()
+  for i, sym in elem.forPubMembers[pubVar]:
+    updateParentBody.add: quote do:
+      if `parentUpdates`.changed[`i`]:
+        `sym`[] = `parentUpdates`.vals[`i`]
+  updateParentBody = reactToChanges(updateParentBody, members, patch, updateParent)
+
+  var asRefs = newStmtList()
+  for sym in pubVarVals:
+    asRefs.add: quote do:
+      let `sym` = addr `sym`
+
+  var captureCall = newCall(bindSym"capture")
+  for sym in pubVarVals:
+    captureCall.add sym
+
+  captureCall.add: quote do:
+    `forComponent`.create do (`parentUpdates`: Updates[`PubVarType`]):
+      `updateParentBody`
+      
+  quote do:
+    `sym`.add (
+      `pubLetVals`, `pubVarVals`,
+      block:
+        `asRefs`
+        `captureCall`
+    )
+    `sym`[^1].instance.update(
+      newUpdates(`pubLetVals`, newSeqWith[bool](len(`forComponent`.pubLets), true)),
+      newUpdates(`pubVarVals`, newSeqWith[bool](len(`forComponent`.pubVars), true))
+    )
+
+
+proc buildElemsInit(
+  templ: TemplFlat[CodeBlock],
+  members: Members,
+  patch, updateParent: NimNode
+): NimNode =
 
   result = newStmtList()
   for elem in templ:
@@ -157,51 +242,85 @@ proc buildElemsInit(
     of templTag:
       let tag = elem.tag
       result.add: quote do:
-        let `sym` = document.createElement(`tag`)
+        var `sym` = document.createElement(`tag`)
 
-      for name, valId in elem.attrs:
-        let val = codeBlocks[valId].code
+      for name, val in elem.attrs:
+        let val = val.code
         result.add: quote do:
-          `sym`.setAttr(`name`, `val`)
+          `sym`.setAttrProperly(`name`, `val`)
 
-      for event, codeId in elem.handlers:
-        let code = reactToChanges(codeBlocks[codeId].code)
+      for event, action in elem.handlers:
+        let action = reactToChanges(action.code.unbind, members, patch, updateParent)
+        debugEcho treerepr action
         result.add: quote do:
           `sym`.addEventListener(`event`) do (_: Event):
-            `code`
+            `action`
 
     of templComponent:
-      let component = codeBlocks[elem.component].code
+      let component = elem.component.code
 
       let parentUpdates = genSym(nskParam, "updates")
       var updateParentBody = newStmtList()
       for i, name in elem.pubMembers[pubVar]:
         if name in elem.vars:
-          let val = codeBlocks[elem.vars[name]].code
+          let val = elem.vars[name].code
           updateParentBody.add: quote do:
             if `parentUpdates`.changed[`i`]:
               `val` = `parentUpdates`.vals[`i`]
+      updateParentBody = reactToChanges(updateParentBody, members, patch, updateParent)
 
-      updateParentBody = reactToChanges(updateParentBody)
       result.add: quote do:
-        let `sym` = `component`.create do(`parentUpdates`: Updates[`component`.V]):
+        var `sym` = `component`.create do(`parentUpdates`: Updates[`component`.V]):
           debugEcho "updateParent.."
           debugEcho `parentUpdates`
           `updateParentBody`
 
-      result.add buildComponentUpdate(elem, codeBlocks) do(valId: int) -> NimNode:
+      result.add buildComponentUpdate(elem) do(_: array[MemberKind, seq[int]]) -> NimNode:
         ident"true"
 
     of templText:
-      let text = codeBlocks[elem.text].code
+      let text = elem.text.code
       result.add: quote do:
-        let `sym` = document.createTextNode(`text`)
+        var `sym` = document.createTextNode(`text`)
+
+    of templFor:
+      let
+        forComponent = elem.forComponent
+        templStr = elem.forBody
+        templ = ident"templ"
+
+      var membersDef = newStmtList()
+      for (kind, sectionKind) in [(pubLet, nnkLetSection), (pubVar, nnkVarSection)]:
+        var section = sectionKind.newTree()
+        for i, sym in elem.forPubMembers[kind]:
+          section.add nnkIdentDefs.newTree(
+            sym.postfix("*"), newEmptyNode(),
+            newCall(bindSym"default", elem.forPubMemberTypes[kind][i])
+          )
+        membersDef.add section
+      
+      var createInstances = elem.forHead.code
+      createInstances[^2] = createInstances[^2].unbind
+      createInstances[^1] = buildCreateForInstance(elem, members, patch, updateParent)
+
+      let
+        PubLetType = elem.forPubMemberTypes[pubLet]
+        PubVarType = elem.forPubMemberTypes[pubVar]
+      result.add: quote do:
+        let `forComponent` = component:
+          `membersDef`
+          `templ` `templStr`
+        var `sym`: seq[tuple[
+          pubLets: `PubLetType`, pubVars: `PubVarType`,
+          instance: ComponentInstance[`forComponent`.L, `forComponent`.V]
+        ]]
+        `createInstances`
 
 
 proc buildPatchProc(
-  templ: TemplFlat,
-  codeBlocks: seq[CodeBlock],
-  members: Members
+  templ: TemplFlat[CodeBlock],
+  members: Members,
+  patch, updateParent: NimNode
 ): NimNode =
 
   let changed = genSym(nskParam, "changed")
@@ -210,17 +329,18 @@ proc buildPatchProc(
   var initBody = newStmtList()
 
   # assert that members arent modified by patching:
-  for members in members:
-    for name in members:
-      let sym = ident(name)
-      procBody.add: quote do:
-        let `sym` = `sym`
+  proc buildFixMembers: NimNode =
+    result = newStmtList()
+    for kind in [priv, pubVar]:
+      for name in members[kind]:
+        let sym = ident(name)
+        result.add: quote do:
+          let `sym` = `sym`
 
-
-  func buildChangedCond(i: CodeBlockId): NimNode =
+  func buildChangedCond(refs: array[MemberKind, seq[int]]): NimNode =
     var conds: seq[NimNode]
     for kind in MemberKind:
-      for i in codeBlocks[i].refs[kind]:
+      for i in refs[kind]:
         conds.add: quote do:
           `changed`[`kind`][`i`]
     if len(conds) > 0:
@@ -228,26 +348,81 @@ proc buildPatchProc(
 
   for elem in templ:
     let sym = elem.sym
+    var patchBlock = newStmtList()
+
+    if elem.kind != templFor:
+      patchBlock.add buildFixMembers()
+
     case elem.kind
     of templTag:
-      for name, valId in elem.attrs:
-        if (let cond = buildChangedCond(valId); cond != nil):
-          let val = codeBlocks[valId].code
-          procBody.add: quote do:
-            if `cond`: `sym`.setAttr(`name`, `val`)
+      for name, val in elem.attrs:
+        if (let cond = buildChangedCond(val.refs); cond != nil):
+          let val = val.code
+          patchBlock.add: quote do:
+            if `cond`: `sym`.setAttrProperly(`name`, `val`)
 
     of templComponent:
-      procBody.add buildComponentUpdate(elem, codeBlocks) do(valId: int) -> NimNode:
-        let cond = buildChangedCond(valId)
+      patchBlock.add buildComponentUpdate(elem) do(refs: array[MemberKind, seq[int]]) -> NimNode:
+        let cond = buildChangedCond(refs)
         if cond == nil: ident"false"
         else: cond
 
-
     of templText:
-      if (let cond = buildChangedCond(elem.text); cond != nil):
-        let text = codeBlocks[elem.text].code
-        procBody.add: quote do:
+      if (let cond = buildChangedCond(elem.text.refs); cond != nil):
+        let text = elem.text.code
+        patchBlock.add: quote do:
           if `cond`: `sym`.data = `text`
+
+    of templFor:
+      if (let cond = buildChangedCond(elem.forHead.refs); cond != nil):
+        let instanceId = genSym(nskVar, "i")
+
+        var updateMemberCache = newStmtList()
+        var changed = [pubLet: nnkBracket.newTree(), pubVar: nnkBracket.newTree()]
+        for kind in pubLet..pubVar:
+          let field = ident($kind & "s")
+          for i, member in elem.forPubMembers[kind]:
+            changed[kind].add: quote do:
+              `member` != `sym`[`instanceId`].`field`[`i`]
+          let members = elem.forPubMembers[kind]
+          updateMemberCache.add: quote do:
+            `sym`[`instanceId`].`field` = `members`
+
+        var forStmt = elem.forHead.code
+
+        var updateCall = quote do:
+          `sym`[`instanceId`].instance.update()
+        for kind in pubLet..pubVar:
+          updateCall.add newCall(bindSym"newUpdates",
+            elem.forPubMembers[kind],
+            changed[kind].prefix("@")
+          )
+        let fixMembers = buildFixMembers()
+        let createInstance = buildCreateForInstance(elem, members, patch, updateParent)
+        let component = elem.forComponent
+        let parent = templ[elem.parentId].sym
+        let hook = if elem.hookId < 0: newNilLit()
+                   else: templ[elem.hookId].sym
+        forStmt[^1] = quote do:
+          if `instanceId` < len(`sym`):
+            `fixMembers`
+            `updateCall`
+            `updateMemberCache`
+          else:
+            `createInstance`
+            `sym`[`instanceId`].instance.mount(`parent`, `hook`)
+          inc `instanceId`
+        patchBlock.add: quote do:
+          if `cond`:
+            var `instanceId` = 0
+            `forStmt`
+            if `instanceId` < len(`sym`):
+              for elem in `sym`[`instanceId`..^1]:
+                elem.instance.detach(`parent`)
+              `sym`.setLen `instanceId`
+
+    procBody.add: quote do:
+      block: `patchBlock`
 
   quote do:
     proc(`changed`: array[MemberKind, seq[bool]]) =
@@ -256,7 +431,7 @@ proc buildPatchProc(
       `procBody`
 
 
-proc buildMountProc(templ: TemplFlat): NimNode =
+proc buildMountProc(templ: TemplFlat[CodeBlock]): NimNode =
   var procBody = newStmtList()
 
   let
@@ -266,7 +441,8 @@ proc buildMountProc(templ: TemplFlat): NimNode =
   for elem in templ:
     let sym = elem.sym
     procBody.add:
-      if elem.kind == templComponent:
+      case elem.kind
+      of templComponent:
         if elem.parentId < 0:
           quote do:
             `sym`.mount(`rootParent`, `rootHook`)
@@ -274,6 +450,19 @@ proc buildMountProc(templ: TemplFlat): NimNode =
           let parent = templ[elem.parentId].sym
           quote do:
             `sym`.mount(`parent`, nil)
+
+      of templFor:
+        if elem.parentId < 0:
+          quote do:
+            for elem in `sym`:
+              elem.instance.mount(`rootParent`, `rootHook`)
+        else:
+          let parent = templ[elem.parentId].sym
+          quote do:
+            for elem in `sym`:
+              debugEcho "mount for elem.."
+              elem.instance.mount(`parent`, nil)
+
       else:
         if elem.parentId < 0:
           quote do:
@@ -342,17 +531,13 @@ proc buildDetachProc(templ: TemplFlat): NimNode =
 
 macro compileComponent(
   members: static Members,
-  templFlat: static TemplFlat,
+  templFlat: static TemplFlat[CodeBlockId],
   body: typed
 ): untyped =
 
   let body =
     if body.kind in {nnkStmtList, nnkStmtListExpr}: body
     else: newStmtList(body)
-
-  var templFlat = templFlat
-  for elem in templFlat.mitems:
-    elem.sym = genSym(nskLet, "elem")
 
   var
     memberSyms: seq[NimNode]
@@ -372,16 +557,19 @@ macro compileComponent(
           result.refs &= memberProcRefs[id]
         result.node = node
 
-    of complement(AtomicNodes):
+    of nnkHiddenAddr, nnkHiddenDeref:
+      result = findMemberRefsAndUnbind(node[0])
+
+    of AtomicNodes - {nnkSym}:
+      result.node = node
+
+    else:
       result.node = node.kind.newTree()
       for child in node:
         let (refs, node) = findMemberRefsAndUnbind(child)
         result.refs.add refs
         result.node.add node
       result.refs = deduplicate(result.refs)
-
-    else:
-      result.node = node
 
   var init = newStmtList()
 
@@ -397,7 +585,7 @@ macro compileComponent(
 
     of nnkLetSection:
       for def in stmt:
-        for sym in def[0 ..< ^2]:
+        for i, sym in def[0 ..< ^2]:
           let singleDef = nnkIdentDefs.newTree(ident($sym), def[^2], def[^1])
           init.add:
             if $sym in members[pubLet]:
@@ -405,9 +593,11 @@ macro compileComponent(
               nnkVarSection.newTree(singleDef)
             else:
               nnkLetSection.newTree(singleDef)
+          def[i] = ident($sym)
 
     of nnkProcDef, nnkFuncDef:
       let (refs, procDef) = findMemberRefsAndUnbind(stmt)
+      debugEcho treerepr procDef
       memberProcRefs &= refs
       memberProcs &= stmt[0]
       init.add procDef
@@ -417,7 +607,9 @@ macro compileComponent(
         stmt.expectLen 2
         var codeBlock: CodeBlock
         let (refs, code) = findMemberRefsAndUnbind(stmt[1])
-        codeBlock.code = code
+        codeBlock.code =
+          if code.kind == nnkStmtList and len(code) == 1: code[0]
+          else: code
         for memberId in refs:
           let name = $memberSyms[memberId]
           for kind in MemberKind:
@@ -427,7 +619,6 @@ macro compileComponent(
       
     else: discard
 
-
   for kind, members in members:
     memberTypes[kind] = nnkTupleConstr.newTree()
   for sym in memberSyms:
@@ -435,8 +626,53 @@ macro compileComponent(
     for kind in MemberKind:
       if (let i = members[kind].find(name); i >= 0):
         assert i == len(memberTypes[kind])
-        memberTypes[kind].add getType(sym)
+        memberTypes[kind].add getTypeInst(sym).unbind
         break
+  for kind, td in memberTypes:
+    if len(td) == 0:
+      memberTypes[kind] = nnkTupleConstr.newTree()
+
+  let templFlat = collect:
+    for elem in templFlat:
+      var res = TemplElemFlat[CodeBlock](
+        sym: genSym(nskVar, "elem"),
+        kind: elem.kind,
+        parentId: elem.parentId,
+        hookId: elem.hookId
+      )
+      case elem.kind
+      of templText:
+        res.text = codeBlocks[elem.text]
+
+      of templTag:
+        res.tag = elem.tag
+        for name, val in elem.attrs:
+          res.attrs[name] = codeBlocks[val]
+        for event, action in elem.handlers:
+          res.handlers[event] = codeBlocks[action]
+
+      of templComponent:
+        res.component = codeBlocks[elem.component]
+        res.pubMembers = elem.pubMembers
+        for name, val in elem.vars:
+          res.vars[name] = codeBlocks[val]
+
+      of templFor:
+        res.forHead = codeBlocks[elem.forHead]
+        res.forBody = elem.forBody
+        res.forComponent = genSym(nskLet, "component")
+        res.forPubMembers = [nnkTupleConstr.newTree(), nnkTupleConstr.newTree()]
+        res.forPubMemberTypes = [nnkTupleConstr.newTree(), nnkTupleConstr.newTree()]
+        for sym in getForVars(res.forHead.code):
+          assert sym.kind == nnkSym
+          let td = sym.getTypeInst()
+          if td.kind == nnkVarTy:
+            res.forPubMembers[pubVar].add ident($sym)
+            res.forPubMemberTypes[pubVar].add td[0].unbind
+          else:
+            res.forPubMembers[pubLet].add ident($sym)
+            res.forPubMemberTypes[pubLet].add td.unbind
+      res
 
 
   let
@@ -444,8 +680,8 @@ macro compileComponent(
     updateParent = genSym(nskParam, "updateParent")
 
   let
-    initElems = buildElemsInit(templFlat, codeBlocks, members, patch, updateParent)
-    patchProc = buildPatchProc(templFlat, codeBlocks, members)
+    initElems = buildElemsInit(templFlat, members, patch, updateParent)
+    patchProc = buildPatchProc(templFlat, members, patch, updateParent)
     mountProc = buildMountProc(templFlat)
     updateProc = buildUpdateProc(members, memberTypes, patch)
     detachProc = buildDetachProc(templFlat)
@@ -469,7 +705,7 @@ macro compileComponent(
         )
     )
 
-  debugEcho repr result
+  #debugEcho repr result
 
 
 macro component*(body: untyped): untyped =
@@ -480,33 +716,39 @@ macro component*(body: untyped): untyped =
     templStr = ""
     initCode = newStmtList()
 
-  for stmt in body:
-    if stmt.kind in {nnkCommand, nnkCall, nnkCallStrLit} and
-       stmt[0].strVal =~= "templ":
-          stmt.expectLen 2
-          assert templStr == ""
-          templStr = stmt[1].strVal
+  proc scanBody(body: NimNode) =
+    for stmt in body:
+      if stmt.kind == nnkStmtList:
+        scanBody stmt
 
-    else:
-      if stmt.kind in {nnkLetSection, nnkVarSection}:
-        let isVar = stmt.kind == nnkVarSection
-        for stmtId, def in stmt:
-          for symId, sym in def[0 ..< ^2]:
-            let T =
-              if def[^2].kind == nnkEmpty:
-                newCall(ident"typeof", def[^1])
-              else: def[^2]
-            if sym.kind == nnkPostfix:  # is pub?
-              assert $sym[0] == "*"
-              if isVar:
-                members[pubVar] &= sym[1].strVal
-              else:
-                members[pubLet] &= sym[1].strVal
-              stmt[stmtId][symId] = sym[1]
-            elif isVar:
-              members[priv] &= sym.strVal
+      elif stmt.kind in {nnkCommand, nnkCall, nnkCallStrLit} and
+         stmt[0].strVal =~= "templ":
+            stmt.expectLen 2
+            assert templStr == ""
+            templStr = stmt[1].strVal
 
-      initCode.add stmt
+      else:
+        if stmt.kind in {nnkLetSection, nnkVarSection}:
+          let isVar = stmt.kind == nnkVarSection
+          for stmtId, def in stmt:
+            for symId, sym in def[0 ..< ^2]:
+              let T =
+                if def[^2].kind == nnkEmpty:
+                  newCall(ident"typeof", def[^1])
+                else: def[^2]
+              if sym.kind == nnkPostfix:  # is pub?
+                assert $sym[0] == "*"
+                if isVar:
+                  members[pubVar] &= sym[1].strVal
+                else:
+                  members[pubLet] &= sym[1].strVal
+                stmt[stmtId][symId] = sym[1]
+              elif isVar:
+                members[priv] &= sym.strVal
+
+        initCode.add stmt
+
+  scanBody body
 
   assert templStr != ""
   let templ = parseTempl(templStr)
@@ -523,9 +765,10 @@ macro component*(body: untyped): untyped =
     of valCode: val.code.prefix("$")
 
   var templFlatDef = nnkBracket.newTree()
-  var elemId = -1
-  proc flattenTempl(templ: TemplElem, parentId = -1) =
-    inc elemId
+  var nextElemId = 0
+  proc flattenTempl(templ: TemplElem, parentId = -1): int =
+    result = nextElemId
+    inc nextElemId
     case templ.kind
     of templTag:
       var attrIds = nnkTableConstr.newTree()
@@ -536,16 +779,19 @@ macro component*(body: untyped): untyped =
         handlerIds.add nnkExprColonExpr.newTree(newLit(name), newLit(addCodeBlock(action)))
       let tag = templ.tag
       templFlatDef.add: quote do:
-        TemplElemFlat(
+        TemplElemFlat[CodeBlockId](
           kind: templTag,
           tag: `tag`,
           attrs: toTable[string, CodeBlockId](`attrIds`),
           handlers: toTable[string, CodeBlockId](`handlerIds`),
           parentId: `parentId`
         )
-      let ownId = elemId
+      var predId = -1
       for child in templ.childs:
-        flattenTempl(child, ownId)
+        let id = flattenTempl(child, result)
+        if predId >= 0:
+          templFlatDef[predId].add nnkExprColonExpr.newTree(ident"hookId", newLit(id))
+        predId = id
 
     of templComponent:
       let component = templ.component
@@ -554,7 +800,7 @@ macro component*(body: untyped): untyped =
       for name, val in templ.vars:
         varIds.add nnkExprColonExpr.newTree(newLit(name), newLit(addCodeBlock(val)))
       templFlatDef.add: quote do:
-        TemplElemFlat(
+        TemplElemFlat[CodeBlockId](
           kind: templComponent,
           component: `componentId`,
           pubMembers: [
@@ -568,10 +814,20 @@ macro component*(body: untyped): untyped =
     of templText:
       let textId = addCodeBlock(templ.text.map(toStrGen).foldl(infix(a, "&", b)))
       templFlatDef.add: quote do:
-        TemplElemFlat(kind: templText, text: `textId`, parentId: `parentId`)
+        TemplElemFlat[CodeBlockId](kind: templText, text: `textId`, parentId: `parentId`)
+
+    of templFor:
+      let headId = addCodeBlock(templ.forHead)
+      let forBody = templ.forBody
+      templFlatDef.add: quote do:
+        TemplElemFlat[CodeBlockId](kind: templFor, forHead: `headId`, forBody: `forBody`, parentId: `parentId`)
     
   for elem in templ:
-    flattenTempl(elem)
+    discard flattenTempl(elem)
 
   result = genAst(members, templFlatDef, initCode):
     compileComponent(members, @templFlatDef, initCode)
+
+
+proc run*(component: Component) =
+  component.create(nil).mount(document.body, nil)

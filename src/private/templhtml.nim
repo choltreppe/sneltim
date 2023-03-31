@@ -11,7 +11,7 @@ type
 
   TemplText* = seq[Val]
 
-  TemplElemKind* = enum templText, templTag, templComponent
+  TemplElemKind* = enum templText, templTag, templComponent, templFor
   TemplElem* = ref object
     case kind*: TemplElemKind
     of templText:
@@ -24,7 +24,10 @@ type
     of templComponent:
       component*: NimNode
       vars*: Table[string, NimNode]
-      body*: seq[TemplElem]
+      componentBody*: seq[TemplElem]
+    of templFor:
+      forHead*: NimNode
+      forBody*: string
 
   Templ* = seq[TemplElem]
 
@@ -52,13 +55,19 @@ func `$`*(elem: TemplElem): string =
     if len(elem.childs) == 0:
       result &= "/>"
     else:
-      result &= fmt">{elem.childs}</>"
+      result &= fmt ">\n{elem.childs}</>"
 
   of templComponent:
     result = "<{" & repr(elem.component) & "}"
     for name, val in elem.vars:
       result &= fmt" {name}={{{repr val}}}"
     result &= "/>"
+
+  of templFor:
+    result = fmt "{{% {repr elem.forHead} %}}\n{elem.forBody}{{% endfor %}}"
+
+  result &= '\n'
+
 
 func `$`*(elems: Templ): string =
   for elem in elems:
@@ -67,11 +76,20 @@ func `$`*(elems: Templ): string =
 func newVal(s: string):  Val = Val(kind: valStr,  str: s)
 func newVal(n: NimNode): Val = Val(kind: valCode, code: n)
 
-
 func merge[T: Table](a, b: T): T =
   result = a
   for k, v in b: result[k] = v
 
+func startsWith(s,prefix: string, start: int): bool =
+  let prefixLen = len(prefix)
+  let sLen = len(s)
+  var i = 0
+  var j = start
+  while true:
+    if i >= prefixLen: return true
+    if j >= sLen or s[j] != prefix[i]: return false
+    inc i
+    inc j
 
 func parseUntilEscaped(s: string, v: var string, c: set[char], start = 0): int =
   var i = start
@@ -109,8 +127,7 @@ func parseTempl*(code: string): Templ =
 
   proc parseElem: TemplElem =
     new result
-    case code[i]
-    of '<':
+    if code[i] == '<':
       inc i
       skipSpaces()
 
@@ -191,9 +208,31 @@ func parseTempl*(code: string): Templ =
 
           result.childs &= parseElem()
 
+    elif code.startsWith("{%", i):
+      i += 2
+      skipSpaces()
+      if code.startsWith("for", i):
+        result.kind = templFor
+        var headStr: string
+        i += code.parseUntil(headStr, "%}", i)
+        result.forHead = parseExpr(headStr & ": discard")
+        i += 2
+        i += code.parseUntil(result.forBody, "{%", i)
+        i += 2
+        skipSpaces()
+        if code[i] == '}': inc i
+        else:
+          assert code.startsWith("endfor", i)  #TODO: err msg
+          i += 6
+          skipSpaces()
+          assert code.startsWith("%}", i)  #TODO: err msg
+          i += 2 
+
+      else: assert false #TODO: err msg
+
     else:
       result.kind = templText
-      while i < len(code) and code[i] != '<':
+      while i < len(code) and code[i] != '<' and not code.startsWith("{%", i):
         result.text.add:
           if code[i] == '{':
             newVal(parseCodeBlock())
