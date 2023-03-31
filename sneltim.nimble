@@ -10,7 +10,6 @@ srcDir        = "src"
 # Dependencies
 
 requires "nim >= 1.9.1"
-requires "parlexgen >= 0.1.7"
 
 
 task test, "test":

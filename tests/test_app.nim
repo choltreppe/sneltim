@@ -1,5 +1,4 @@
-import std/macros
-import sneltim {.all.}
+import sneltim
 
 
 let editableNum = component:
