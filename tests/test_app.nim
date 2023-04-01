@@ -23,7 +23,6 @@ let testComponent = component:
       result += v
 
   templ"""
-    {vals}
     <div>
       <{editableNum} title={"edit a"} value={a}/><br/>
       <{editableNum} title={"edit b"} value={b}/><br/>
