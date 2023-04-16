@@ -16,6 +16,7 @@ let testComponent = component:
   var a = 2  # this is a private member (its not visible to parent)
   var b = 3
   var vals = @[1, 2, 3]
+  var matrix: array[3, array[3, int]]
 
   proc getValSum: int =  # you can use procs
     for v in vals:
@@ -28,8 +29,8 @@ let testComponent = component:
       &"a + b = {a+b}"; <br
       <button(on.click = (inc a; inc b)) "inc a and b"
 
-    <`div`(style="color: #333"):
-      <b ("loop test:"); <br
+    <`div`:
+      <b(style="color: #333") ("loop test:"); <br
 
       for i, v in vals.mpairs:
         <%editableNum(title= "val" & $i, value=v); <button(on.click = (vals[i] += 2)); <br
@@ -39,5 +40,12 @@ let testComponent = component:
       <button(on.click = (vals &= 0)): "add val"
       <button(on.click = (vals.setLen len(vals) - 1)): "del val"
 
+    <`div`:
+      <b "matrix:"; <br;
+
+      for row in matrix.mitems:
+        for v in row.mitems:
+          <%editableNum(value=v);
+        <button(on.click = (for v in row.mitems: inc v)) "inc row"; <br
 
 run testComponent
