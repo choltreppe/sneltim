@@ -7,7 +7,7 @@
 #
 
 
-import std/[macros, genasts, typetraits, sugar, strformat, strutils, sequtils, setutils, tables, options]
+import std/[macros, genasts, typetraits, tables, options]
 import fusion/matching
 import ./utils
 

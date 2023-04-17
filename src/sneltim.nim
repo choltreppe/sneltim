@@ -7,7 +7,7 @@
 #
 
 
-import std/[macros, genasts, typetraits, sugar, sequtils, strutils, setutils, sets, tables, dom]
+import std/[macros, genasts, typetraits, sequtils, strutils, setutils, sets, tables, dom]
 export sets, tables, dom, sequtils
 
 import ./private/[templhtml, utils]
@@ -76,7 +76,8 @@ let
 
 func `=~=`(a,b: string): bool = cmpIgnoreStyle(a, b) == 0
 
-proc setAttrProperly*(node: Node, attr,val: string) =
+proc setAttrProperly*(node: Node, attr: string, val: auto) =
+  let val = cstring($val)
   case attr
   of "value": node.value = val
   else: node.setAttr(attr, val)
@@ -112,12 +113,12 @@ macro componentTyped(
 
   var
     memberSyms: seq[NimNode]
-    getInheritedMember: seq[NimNode]
     memberProcs: seq[NimNode]
     memberProcRefs: seq[seq[int]]   # procId  ->  referenced memberIds
 
   type UnpackMemberLvl = enum justUnbind, getMPatchRef, getMVal
 
+  # generate member access (to either the PatchRef or actual value)
   proc unpackMember(kind: MemberKind, name: string, lvl = getMVal): NimNode =
     assert name in memberNames[kind]
     let members = members[kind]
@@ -214,8 +215,6 @@ macro componentTyped(
       else: val.unbind
 
   proc addPubMemberInit(kind: range[pubLet..pubVar], name: string, defaultVal: NimNode) =
-    let members = members[kind]
-    let field = ident(name)
     membersConstr[kind].add nnkExprColonExpr.newTree(
       ident(name),
       newCall(bindSym"newPatchRef", defaultVal)
@@ -494,7 +493,6 @@ macro componentTyped(
           proc `patchProc` = body
           `patchProc`()
         for kind, refs in refs:
-          let members = members[kind]
           for i in refs:
             let member {.inject.} = unpackMember(kind, memberNames[kind][i], getMPatchRef)
             procBody.add: quote do:
@@ -505,7 +503,7 @@ macro componentTyped(
       case elem.kind
       of templText:
         addPatch(elem.text):
-          `sym`.data = `code`
+          `sym`.data = cstring(`code`)
 
       of templTag:
         for name, val in elem.attrs:
@@ -556,7 +554,6 @@ macro componentTyped(
           for memberId in elem.forHead.refs[kind]:
             let memberNames = memberNames[kind][memberId]
             let member = unpackMember(kind, memberNames, getMPatchRef)
-            let skipPatchId = genSym(nskLet, "skipPatch")
             patchContainerDef.add: quote do:
               `member`.patchProcs &= `patchForIters`
             patchContainerBody.add: quote do:
@@ -684,7 +681,6 @@ macro componentTyped(
 
   let detachProc = block:
     var procBody = newStmtList()
-    let parent = genSym(nskParam, "parent")
     for elem in templ.elems:
       if elem.parentId < 0:
         let sym = elem.sym
@@ -737,7 +733,7 @@ macro componentTyped(
         )
     )
 
-  debugEcho treerepr result
+  debugEcho repr result
 
 
 
@@ -767,10 +763,6 @@ macro component*(body: untyped): untyped =
           let isVar = stmt.kind == nnkVarSection
           for stmtId, def in stmt:
             for symId, sym in def[0 ..< ^2]:
-              let T =
-                if def[^2].kind == nnkEmpty:
-                  newCall(ident"typeof", def[^1])
-                else: def[^2]
               if sym.kind == nnkPostfix:  # is pub?
                 assert $sym[0] == "*"
                 if isVar:
