@@ -21,7 +21,7 @@ type
     refs*: array[MemberKind, seq[int]]
     isStmt*: bool
 
-  TemplElemKind* = enum templText, templTag, templComponent, templFor#, templIf
+  TemplElemKind* = enum templText, templTag, templComponent, templFor, templIf
   TemplElem* = ref object
     sym*: NimNode
 
@@ -43,6 +43,13 @@ type
       forHead*: CodeBlockId
       forBody*: Templ
       forComponent*: NimNode
+
+    of templIf:
+      elifBranches*: seq[tuple[
+        cond: CodeBlockId,
+        body: Templ
+      ]]
+      elseBody*: Option[Templ]
 
     parentId*: int
     hookId*: int = -1
@@ -86,6 +93,16 @@ func toAstGen(elem: TemplElem): NimNode =
   of templFor:
     addField("forHead", elem.forHead.toAstGen)
     addField("forBody", elem.forBody.toAstGen)
+  of templIf:
+    var elifBranches = nnkBracket.newTree()
+    for (cond, body) in elem.elifBranches:
+      elifBranches.add nnkTupleConstr.newTree(cond.toAstGen, body.toAstGen)
+    addField("elifBranches", elifBranches.prefix("@"))
+    addField("elseBody"):
+      if Some(@body) ?= elem.elseBody:
+        newCall(bindSym"some", body.toAstGen)
+      else:
+        newCall(bindSym"none", bindSym"Templ")
 
 func toAstGen*(templ: Templ): NimNode =
   var elems = nnkBracket.newTree()
@@ -192,6 +209,22 @@ proc parseTempl*(body: NimNode): Templ =
       forHead.add newEmptyNode()
       templ.elems[^1].forHead.setCodeBlock(forHead, isStmt=true)
       templ.elems[^1].forBody = parseTempl(node[^1])
+
+    elif node.kind == nnkIfStmt:
+      templ.elems[^1].kind = templFor
+      for branch in node:
+        case branch.kind
+        of nnkElifBranch:
+          branch.expectLen 2
+          templ.elems[^1].elifBranches.setLen(len(templ.elems[^1].elifBranches) + 1)
+          templ.elems[^1].elifBranches[^1].cond.setCodeBlock(branch[0])
+          templ.elems[^1].elifBranches[^1].body = parseTempl(branch[1])
+        of nnkElse:
+          branch.expectLen 1
+          assert templ.elems[^1].elseBody.isNone
+          templ.elems[^1].elseBody = some(parseTempl(branch[0]))
+        else:
+          assert false
 
     else:
       debugEcho treerepr node

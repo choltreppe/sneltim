@@ -17,6 +17,7 @@ let testComponent = component:
   var b = 3
   var vals = @[1, 2, 3]
   var matrix: array[3, array[3, int]]
+  var listlen0, listlen1 = 2
 
   proc getValSum: int =  # you can use procs
     for v in vals:
@@ -47,5 +48,17 @@ let testComponent = component:
         for v in row.mitems:
           <%editableNum(value=v);
         <button(on.click = (for v in row.mitems: inc v)) "inc row"; <br
+
+    <`div`:
+      <b "hook test (2 for loops):"; <br;
+
+      for _ in 0 ..< listlen0:
+        "0"; <br
+      for _ in 0 ..< listlen1:
+        "1"; <br
+      
+      <%editableNum(title="list0", value=listlen0);
+      <%editableNum(title="list1", value=listlen1);
+
 
 run testComponent

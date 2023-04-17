@@ -34,7 +34,7 @@ proc patch(pr: PatchRef, init = false) =
 
 
 type
-  # for some reason I cant use Members as typeclass for Component
+  # for some reason I cant use Members as typeclass for Components generic params
   Members = concept m
     m is ref object
     for f in m[].fields:
@@ -46,6 +46,11 @@ type
     detach: proc()
     pubLetMembers: L
     pubVarMembers: V
+    getFirstNode: proc: Node
+
+  ComponentInstanceSeq[L,V] = object
+    instances: seq[ComponentInstance[L,V]]
+    getFirstNode: proc: Node
 
   Component*[L,V] = object
     create: proc: ComponentInstance[L,V]
@@ -53,9 +58,15 @@ type
 template instanceType(c: Component): type =
   ComponentInstance[c.L, c.V]
 
-proc patch(members: ref object, init = false) =
+template instanceSeqType(c: Component): type =
+  ComponentInstanceSeq[c.L, c.V]
+
+
+proc patch[M: Members](members: M, init = false) =
   for member in members[].fields:
     patch member, init
+
+proc getFirstNode*(node: Node): Node = node
   
 
 let
@@ -70,12 +81,15 @@ proc setAttrProperly*(node: Node, attr,val: string) =
   of "value": node.value = val
   else: node.setAttr(attr, val)
 
+
 func getForVars(forStmt: NimNode): seq[NimNode] =
-  assert forStmt.kind == nnkForStmt
+  forStmt.expectKind nnkForStmt
+  template addVar(sym: NimNode) =
+    if $sym != "_": result.add sym
   for node in forStmt[0 ..< ^2]:
     if node.kind == nnkVarTuple:
-      for sym in node: result.add sym
-    else: result.add node
+      for sym in node: addVar sym
+    else: addVar node
 
 
 
@@ -172,8 +186,8 @@ macro componentTyped(
   let
     membersTypes = [
       priv:   genSym(nskType, "PrivMembers"),
-      pubLet: genSym(nskType, "pubLetType"),
-      pubVar: genSym(nskType, "pubVarType"),
+      pubLet: genSym(nskType, "PubLetMembers"),
+      pubVar: genSym(nskType, "PubVarMembers"),
     ]
 
   var
@@ -353,6 +367,16 @@ macro componentTyped(
     rootParent = genSym(nskVar, "rootParent")
     rootHook = genSym(nskVar, "rootHook")
 
+  proc parent(elem: TemplElem): NimNode =
+    if elem.parentId >= 0: 
+      templ.elems[elem.parentId].sym
+    else: rootParent
+
+  proc hook(elem: TemplElem): NimNode =
+    if elem.hookId >= 0:
+      templ.elems[elem.hookId].sym
+    else: rootHook
+
 
   let patchAll = genSym(nskProc, "patchAll")
   let patchAllDef = block:
@@ -367,7 +391,7 @@ macro componentTyped(
 
 
   let defElems = block:
-    var result = newStmtList()
+    var result, resultDefer = newStmtList()
 
     var nextForId = 0
     for elem in templ.elems:
@@ -429,12 +453,30 @@ macro componentTyped(
         let componentDef = genAst(forMemberNames, membersInheritDef, templ = elem.forBody.toAstGen, componentBody):
           componentTyped(forMemberNames, toTable[string, NimNode](membersInheritDef), templ, componentBody)
 
+        let hook = elem.hook
+
         let component = elem.forComponent
         result.add: quote do:
           let `component` = `componentDef`
-          var `sym`: seq[instanceType(`component`)]
+          var `sym`: instanceSeqType(`component`)
 
+        resultDefer.add: quote do:
+          `sym`.getFirstNode = proc: Node =
+            if len(`sym`.instances) > 0:
+              `sym`.instances[0].getFirstNode()
+            else:
+              `hook`.getFirstNode()
+
+      of templIf: discard #TODO
+
+    result.add resultDefer
     result
+
+
+  let getFirstNodeProc = block:
+    let firstNode = templ.elems[0].sym
+    quote do:
+      proc: Node = `firstNode`.getFirstNode()
 
 
   let initProc = block:
@@ -494,9 +536,7 @@ macro componentTyped(
             when `name` in getFieldNames(`component`.L):
               `sym`.pubLetMembers.`field` = newPatchRef(`code`)
             elif `name` in getFieldNames(`component`.V):
-              `sym`.pubVarMembers.`field` = `codeRaw`
-              debugEcho "set pub var"
-              debugEcho `codeRaw`[].val[]
+              `sym`.pubVarMembers.`field` = `codeRaw`  #TODO: add err msg if not just a member
             else:
               assert false  #TODO: err msg
         procBody.add: quote do:
@@ -528,7 +568,7 @@ macro componentTyped(
 
         proc buildNewInstance: NimNode =
           result = newStmtList: quote do:
-            `sym` &= `component`.create()
+            `sym`.instances &= `component`.create()
           for forVar in forVars:
             let varIdent = ident($forVar)
             let td = forVar.getTypeInst()
@@ -536,46 +576,42 @@ macro componentTyped(
               if td.kind == nnkVarTy:
                 let td = td[0]
                 quote do:
-                  `sym`[^1].pubVarMembers.`varIdent` =
+                  `sym`.instances[^1].pubVarMembers.`varIdent` =
                     PatchRef[`td`](
                       val: cast[ref `td`](addr `varIdent`),
                       patchProcs: @[`patchContainer`]
                     )
               else:
                 quote do:
-                  `sym`[^1].pubLetMembers.`varIdent` = newPatchRef(`varIdent`)
+                  `sym`.instances[^1].pubLetMembers.`varIdent` = newPatchRef(`varIdent`)
           result.add: quote do:
-            `sym`[^1].init()
+            `sym`.instances[^1].init()
 
         # build proc that updates the instances (and adds/removes)
         var patchForItersBody = newStmtList()
         let iterId = genSym(nskVar, "i")
         var patchForItersForStmt = new elem.forHead.code[]
         let newInstance = buildNewInstance()
-        let parent =
-          if elem.parentId < 0: rootParent
-          else: templ.elems[elem.parentId].sym
-        let hook =
-          if elem.hookId < 0: rootHook
-          else: templ.elems[elem.hookId].sym
+        let parent = elem.parent
+        let hook = elem.hook
         patchForItersForStmt[^1] = quote do:
-          if `iterId` < len(`sym`):
-            patch `sym`[`iterId`].pubLetMembers
-            patch `sym`[`iterId`].pubVarMembers
+          if `iterId` < len(`sym`.instances):
+            patch `sym`.instances[`iterId`].pubLetMembers
+            patch `sym`.instances[`iterId`].pubVarMembers
           else:
             debugEcho "mount new instance .."
             `newInstance`
-            `sym`[^1].mount(`parent`, `hook`)
+            `sym`.instances[^1].mount(`parent`, `hook`.getFirstNode())
           inc `iterId`
         patchForItersBody.add: quote do:
           var `iterId` = 0
           `patchForItersForStmt`
           debugEcho `iterId`
-          if `iterId` < len(`sym`):
+          if `iterId` < len(`sym`.instances):
             debugEcho "detach instances .."
-            for i in `iterId` ..< len(`sym`):
-              `sym`[i].detach()
-            `sym`.setLen `iterId`
+            for i in `iterId` ..< len(`sym`.instances):
+              `sym`.instances[i].detach()
+            `sym`.instances.setLen `iterId`
 
         var buildInstances = new elem.forHead.code[]
         buildInstances[^1] = buildNewInstance()
@@ -585,6 +621,8 @@ macro componentTyped(
           `patchContainerDef`
           `buildInstances`
           proc `patchForIters` {.closure.} = `patchForItersBody`
+
+      of templIf: discard #TODO
 
     quote do:
       proc = `procBody`
@@ -607,7 +645,7 @@ macro componentTyped(
             quote do:
               `sym`.mount(`rootParent`, `rootHook`)
           else:
-            let parent = templ.elems[elem.parentId].sym
+            let parent = elem.parent
             quote do:
               `sym`.mount(`parent`, nil)
 
@@ -615,13 +653,15 @@ macro componentTyped(
         addToBothBodys:
           if elem.parentId < 0:
             quote do:
-              for elem in `sym`:
+              for elem in `sym`.instances:
                 elem.mount(`rootParent`, `rootHook`)
           else:
-            let parent = templ.elems[elem.parentId].sym
+            let parent = elem.parent
             quote do:
-              for elem in `sym`:
+              for elem in `sym`.instances:
                 elem.mount(`parent`, nil)
+
+      of templIf: discard #TODO
 
       else:
         if elem.parentId < 0:
@@ -630,7 +670,7 @@ macro componentTyped(
           withHookBody.add: quote do:
             `rootParent`.insertBefore(`sym`, `rootHook`)
         else:
-          let parent = templ.elems[elem.parentId].sym
+          let parent = elem.parent
           addToBothBodys: quote do:
             `parent`.appendChild(`sym`)
 
@@ -646,16 +686,25 @@ macro componentTyped(
     var procBody = newStmtList()
     let parent = genSym(nskParam, "parent")
     for elem in templ.elems:
-      if elem.kind == templFor: continue
       if elem.parentId < 0:
         let sym = elem.sym
         procBody.add:
-          if elem.kind == templComponent:
-            quote do:
-              `sym`.detach()
-          else:
+          case elem.kind
+          of templText, templTag:
             quote do:
               `rootParent`.removeChild(`sym`)
+
+          of templComponent:
+            quote do:
+                `sym`.detach()
+
+          of templFor:
+            quote do:
+              for elem in `sym`.instances:
+                elem.detach()
+
+          of templIf: continue #TODO
+
     quote do:
       proc =
         `procBody`
@@ -670,7 +719,6 @@ macro componentTyped(
 
   result = quote do:
     `pubMembersTypeDefs`
-    static: debugEcho `pubLetType` is Members
     Component[`pubLetType`, `pubVarType`](
       create: proc: ComponentInstance[`pubLetType`, `pubVarType`] =
         `privMembersTypeDef`
@@ -684,11 +732,12 @@ macro componentTyped(
           mount: `mountProc`,
           detach: `detachProc`,
           pubLetMembers: `pubLetMembers`,
-          pubVarMembers: `pubVarMembers`
+          pubVarMembers: `pubVarMembers`,
+          getFirstNode: `getFirstNodeProc`
         )
     )
 
-  debugEcho repr result
+  debugEcho treerepr result
 
 
 
