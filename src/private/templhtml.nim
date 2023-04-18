@@ -47,9 +47,13 @@ type
     of templIf:
       elifBranches*: seq[tuple[
         cond: CodeBlockId,
-        body: Templ
+        body: Templ,
+        component: NimNode
       ]]
-      elseBody*: Option[Templ]
+      elseBody*: Option[tuple[
+        body: Templ,
+        component: NimNode
+      ]]
 
     parentId*: int
     hookId*: int = -1
@@ -57,6 +61,12 @@ type
   Templ* = object
     elems*: seq[TemplElem]
     codeBlocks*: seq[CodeBlock]
+
+  TemplElemControlFlowKinds* = range[templFor..templIf]
+
+
+func `[]`*(codeBlocks: seq[CodeBlock], id: CodeBlockId): CodeBlock =
+  codeBlocks[int(id)]
 
 
 func toAstGen(id: CodeBlockId): NimNode =
@@ -95,14 +105,15 @@ func toAstGen(elem: TemplElem): NimNode =
     addField("forBody", elem.forBody.toAstGen)
   of templIf:
     var elifBranches = nnkBracket.newTree()
-    for (cond, body) in elem.elifBranches:
-      elifBranches.add nnkTupleConstr.newTree(cond.toAstGen, body.toAstGen)
+    for (cond, body, _) in elem.elifBranches:
+      elifBranches.add nnkTupleConstr.newTree(cond.toAstGen, body.toAstGen, newNilLit())
     addField("elifBranches", elifBranches.prefix("@"))
     addField("elseBody"):
-      if Some(@body) ?= elem.elseBody:
-        newCall(bindSym"some", body.toAstGen)
+      if Some((@body, _)) ?= elem.elseBody:
+        let bodyGen = body.toAstGen
+        quote do: some((`bodyGen`, nil))
       else:
-        newCall(bindSym"none", bindSym"Templ")
+        quote do: none((Templ, NimNode))
 
 func toAstGen*(templ: Templ): NimNode =
   var elems = nnkBracket.newTree()
@@ -211,7 +222,7 @@ proc parseTempl*(body: NimNode): Templ =
       templ.elems[^1].forBody = parseTempl(node[^1])
 
     elif node.kind == nnkIfStmt:
-      templ.elems[^1].kind = templFor
+      templ.elems[^1].kind = templIf
       for branch in node:
         case branch.kind
         of nnkElifBranch:
@@ -222,12 +233,11 @@ proc parseTempl*(body: NimNode): Templ =
         of nnkElse:
           branch.expectLen 1
           assert templ.elems[^1].elseBody.isNone
-          templ.elems[^1].elseBody = some(parseTempl(branch[0]))
+          templ.elems[^1].elseBody = some((parseTempl(branch[0]), NimNode(nil)))
         else:
           assert false
 
     else:
-      debugEcho treerepr node
       templ.elems[^1].kind = templText
       templ.elems[^1].text.setCodeBlock(node)
 

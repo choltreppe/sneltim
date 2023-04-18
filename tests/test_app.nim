@@ -1,3 +1,6 @@
+# just a pretty random testing playground
+
+
 import sneltim
 import std/strformat
 
@@ -36,6 +39,9 @@ let testComponent = component:
       for i, v in vals.mpairs:
         <%editableNum(title= "val" & $i, value=v); <button(on.click = (vals[i] += 2)); <br
 
+      for v in vals:
+        $v; <br
+
       <b &"sum: {getValSum()}"; <br
         
       <button(on.click = (vals &= 0)): "add val"
@@ -53,12 +59,15 @@ let testComponent = component:
       <b "hook test (2 for loops):"; <br;
 
       for _ in 0 ..< listlen0:
-        "0"; <br
+        $listlen0; <br
       for _ in 0 ..< listlen1:
-        "1"; <br
+        "x"; <br
       
-      <%editableNum(title="list0", value=listlen0);
-      <%editableNum(title="list1", value=listlen1);
+      <%editableNum(title="list0", value=listlen0); <br
+      <%editableNum(title="list1", value=listlen1); <br
+
+      if listlen0 == 0:
+        <b "listlen0 == 0"
 
 
 run testComponent
