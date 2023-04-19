@@ -13,6 +13,11 @@ import std/[macros, strutils]
 func `=~=`*(a,b: string): bool = cmpIgnoreStyle(a, b) == 0
 
 
+iterator revItems*[T](x: auto): T =
+  for i in countdown(len(x)-1, 0):
+    yield x[i]
+
+
 func denestStmtList*(node: NimNode): NimNode =
   if node.kind == nnkStmtList:
     result = node
@@ -21,19 +26,27 @@ func denestStmtList*(node: NimNode): NimNode =
   else:
     result = newStmtList(node)
 
+# probably incomplete (i dont realy know the compiler internals)
+func undoHiddenNodes*(node: NimNode): NimNode =
+  case node.kind
+  of nnkHiddenAddr, nnkHiddenDeref: undoHiddenNodes(node[0])
+  of nnkHiddenStdConv: undoHiddenNodes(node[1])
+  of AtomicNodes: node
+  else:
+    var res = node.kind.newTree()
+    for node in node:
+      res.add undoHiddenNodes(node)
+    res
+  
 
-iterator getFieldIdentsNodes*(T: NimNode): NimNode =
+macro getFieldNames*(T: typedesc[tuple | ref tuple]): seq[string] =
+  result = nnkBracket.newTree()
   var td = T.getType[1]
   if td.kind == nnkBracketExpr and $td[0] == "ref":
     td = td[1]
-  for defs in td.getTypeImpl[2]:
+  for defs in td.getTypeImpl:
     for sym in defs[0 ..< ^2]:
-      yield sym
-
-macro getFieldNames*(T: typedesc[object | ref object]): seq[string] =
-  result = nnkBracket.newTree()
-  for sym in getFieldIdentsNodes(T):
-    result &= newLit($sym)
+      result &= newLit($sym)
   result = result.prefix("@")
 
 
