@@ -7,7 +7,7 @@
 #
 
 
-import std/[macros, strutils]
+import std/[macros, strutils, setutils]
 
 
 func `=~=`*(a,b: string): bool = cmpIgnoreStyle(a, b) == 0
@@ -17,6 +17,15 @@ iterator revItems*[T](x: auto): T =
   for i in countdown(len(x)-1, 0):
     yield x[i]
 
+template findIt*(container, elem, get: untyped): untyped =
+  var res = -1
+  var i = 0
+  for it {.inject.} in container:
+    if get == elem:
+      res = i
+      break
+    inc i
+  res
 
 func denestStmtList*(node: NimNode): NimNode =
   if node.kind == nnkStmtList:
@@ -37,6 +46,17 @@ func undoHiddenNodes*(node: NimNode): NimNode =
     for node in node:
       res.add undoHiddenNodes(node)
     res
+
+func unbindSyms*(node: NimNode): NimNode =
+  case node.kind
+  of nnkSym:
+    result = ident($node)
+  of complement(AtomicNodes):
+    result = node.kind.newTree()
+    for node in node:
+      result.add unbindSyms(node)
+  else:
+    result = node
   
 
 macro getFieldNames*(T: typedesc[tuple | ref tuple]): seq[string] =

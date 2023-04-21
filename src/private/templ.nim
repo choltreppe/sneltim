@@ -65,7 +65,7 @@ func `$`*(templ: Templ, indent = 0): string =
 
 proc newTemplText*(s: string) = discard
 proc newTemplTag*(name: string, params,handlers: tuple, content: proc = nil) = discard
-proc newTemplComponent*(name: string, params: tuple, content: proc = nil) = discard
+proc newTemplComponent*(component: proc, params: tuple, content: proc = nil) = discard
 
 let templDefLabel* {.compiletime.} = genSym(nskLabel, "templDef")
 
@@ -83,33 +83,52 @@ proc destructureCall(call: NimNode): tuple[callee, attrs, handlers: NimNode] =
       result.callee = result.callee[0]
     for param in call[1..^1]:
       param.expectKind nnkExprEqExpr
-      let val = param[1]
-      proc addVal(table: var NimNode, name: NimNode) =
-        name.expectKind {nnkIdent, nnkSym}
-        table.add nnkExprColonExpr.newTree(name, val)
       if param[0].kind == nnkBracketExpr:
         param[0].expectLen 2
         param[0][0].expectKind {nnkIdent, nnkSym}
         let class = $param[0][0]
         case class
-        of "on": result.handlers.addVal(name=param[0][1])
-        else: error fmt"invalid `{class}`"
+        of "on":
+          param[0][1].expectKind {nnkIdent, nnkSym}
+          result.handlers.add nnkExprColonExpr.newTree(
+            param[0][1],
+            nnkLambda.newTree(
+              newEmptyNode(), newEmptyNode(), newEmptyNode(),
+              nnkFormalParams.newTree(newEmptyNode()),
+              newEmptyNode(), newEmptyNode(), 
+              param[1]
+            )
+          )
+        else:
+          error fmt"invalid `{class}`"
       else:
-        result.attrs.addVal(name=param[0])
+        param[0].expectKind {nnkIdent, nnkSym}
+        result.attrs.add nnkExprColonExpr.newTree(param[0], param[1])
+
   else:
     result.callee = call
 
-proc newTemplTagImpl(call: NimNode): NimNode =
+proc cosiderCommandSyntax(call, body: NimNode): tuple[call, body: NimNode] =
+  if body.kind == nnkEmpty and call.kind == nnkCommand:
+    call.expectLen 2
+    (call[0], call[1])
+  else: (call, body)
+
+proc newTemplTagImpl(call: NimNode, body = newEmptyNode()): NimNode =
+  let (call, body) = cosiderCommandSyntax(call, body)
   let (callee, attrs, handlers) = destructureCall(call)
   callee.expectKind {nnkIdent, nnkSym}
-  newCall(bindSym"newTemplTag", newLit($callee), attrs, handlers)
+  result = newCall(bindSym"newTemplTag", newLit($callee), attrs, handlers)
+  if body.kind != nnkEmpty:
+    result.add body.denestStmtList
 
-proc newTemplComponentImpl(call: NimNode): NimNode =
+proc newTemplComponentImpl(call: NimNode, body = newEmptyNode()): NimNode =
+  let (call, body) = cosiderCommandSyntax(call, body)
   let (callee, attrs, handlers) = destructureCall(call)
   if len(handlers) > 0:
     for handler in handlers: error "components dont have event handlers", handler[0]
   callee.expectKind {nnkIdent, nnkSym}
-  newCall(bindSym"newTemplComponent", newLit($callee), attrs)
+  newCall(bindSym"newTemplComponent", callee, attrs)
 
 template templToTypable(blockLabel, templDef: untyped) =
 
@@ -120,15 +139,13 @@ template templToTypable(blockLabel, templDef: untyped) =
     newTemplTagImpl(call)
 
   macro `<>`(call, body: untyped) {.inject.} =
-    result = newTemplTagImpl(call)
-    result.add body
+    newTemplTagImpl(call, body)
 
   macro `<%>`(call: untyped) {.inject.} =
     newTemplComponentImpl(call)
 
   macro `<%>`(call, body: untyped) {.inject.} =
-    result = newTemplComponentImpl(call)
-    result.add body
+    newTemplComponentImpl(call, body)
 
   block blockLabel:
     templDef
@@ -162,6 +179,7 @@ proc parseTempl*(node: NimNode): Templ =
         elem.tag = node[1].strVal
         elem.attrs = tupleDefToTable(node[2])
         elem.handlers = tupleDefToTable(node[3])
+        if node[4].kind == nnkEmpty: continue
         node[4].expectKind nnkLambda
         elem.childs = parseTempl(node[4][6])
 
