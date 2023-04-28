@@ -13,20 +13,21 @@ import ./utils
 type
   TemplElemKind* = enum templText, templTag, templComponent, templFor
   TemplElem* = ref object
-    elemSym: NimNode
-    case kind: TemplElemKind
+    sym*: NimNode
+    case kind*: TemplElemKind
     of templText:
-      text: NimNode
+      text*: NimNode
     of templTag:
-      tag: string
-      attrs, handlers: Table[string, NimNode]
-      childs: seq[TemplElem]
+      tag*: string
+      attrs*, handlers*: Table[string, NimNode]
+      childs*: seq[TemplElem]
     of templComponent:
-      component: NimNode
-      params: Table[string, NimNode]
+      component*: NimNode
+      params*: Table[string, NimNode]
     of templFor:
-      forHead: seq[NimNode]
-      forBody: seq[TemplElem]
+      forHead*: NimNode
+      forBody*: Templ
+      forComponent*: NimNode
 
   Templ* = seq[TemplElem]
 
@@ -55,8 +56,8 @@ func `$`*(templ: Templ, indent = 0): string =
       result.add ">"
     of templFor:
       result.add "for " &
-        elem.forHead[0 ..< ^1].mapIt(it.repr).join(", ") &
-        " in " & elem.forHead[^1].repr & ":\n"
+        elem.forHead[0 ..< ^2].mapIt(it.repr).join(", ") &
+        " in " & elem.forHead[^2].repr & ":\n"
       result.add `$`(elem.forBody, indent+1)
 
     if elem.kind notin {templFor}:
@@ -162,7 +163,7 @@ proc tupleDefToTable(tupleDef: NimNode): Table[string, NimNode] =
 
 proc parseTempl*(node: NimNode): Templ =
   for node in node.denestStmtList.undoHiddenNodes:
-    var elem = TemplElem(elemSym: genSym(nskVar, "elem"))
+    var elem = TemplElem(sym: genSym(nskVar, "elem"))
 
     case node.kind
     of nnkCall:
@@ -178,7 +179,9 @@ proc parseTempl*(node: NimNode): Templ =
         node[1].expectKind nnkStrLit
         elem.tag = node[1].strVal
         elem.attrs = tupleDefToTable(node[2])
-        elem.handlers = tupleDefToTable(node[3])
+        for event, action in tupleDefToTable(node[3]):
+          action.expectKind nnkLambda
+          elem.handlers[event] = action[6]
         if node[4].kind == nnkEmpty: continue
         node[4].expectKind nnkLambda
         elem.childs = parseTempl(node[4][6])
@@ -191,9 +194,10 @@ proc parseTempl*(node: NimNode): Templ =
 
     of nnkForStmt:
       elem.kind = templFor
-      for node in node[0 ..< ^1]:
-        elem.forHead.add node
+      elem.forComponent = genSym(nskLet, "forComponent")
       elem.forBody.add parseTempl(node[^1])
+      elem.forHead = node
+      elem.forHead[^1] = newEmptyNode()
 
     else: assert false
 

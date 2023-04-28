@@ -2,19 +2,29 @@ import sneltim
 import std/[macros, strformat]
 
 
-proc editableNum: int = 42
+let editableNum = component:
+  let title* = ""  # this is a public let member (it can only be set (and changed) from parent)
+  var value*: int  # this is a public var member (it can be set from parent and self, and chnages from self effect parent)
+
+  html:
+    text title & ":"
+    <>button(on[click] = dec value): text "-"
+    text $value
+    <>button(on[click] = inc value): text "+"
+
 
 let testComp = component:
 
   var x = [2,6,3]
-  let y* = "foo"
-  let z = 0.7
-  var w*: char
 
   html:
-    <>`div`(a = 6, on[click] = inc x[0]):
-      <%>editableNum(value=x[1], title="foo:")
+    <%>editableNum(value=x[1], title="foo"); <>br
+    <>`div`(a = 6, on[click] = inc x[1]):
       (<>b text "x"); <>br
+      text $x
       for i, v in x:
         <>a(href="/"):
           text $v
+
+
+run testComp

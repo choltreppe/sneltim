@@ -13,7 +13,7 @@ import std/[macros, strutils, setutils]
 func `=~=`*(a,b: string): bool = cmpIgnoreStyle(a, b) == 0
 
 
-iterator revItems*[T](x: auto): T =
+iterator revItems*[T](x: openarray[T]): T =
   for i in countdown(len(x)-1, 0):
     yield x[i]
 
@@ -89,3 +89,14 @@ func getIfCondBindings*(cond: NimNode): seq[NimNode] =
             for sym in defs[0 ..< ^2]:
               if $sym != "_":
                 result.add sym
+
+
+func isVarType(td: NimNode): bool =
+  td.kind == nnkBracketExpr and td[0].kind == nnkSym and $td[0] == "var"
+
+func isVar*(node: NimNode): bool =
+  node.getType.isVarType
+
+func paramsMut*(node: NimNode): seq[bool] =
+  for td in node.getType[2..^1]:
+    result.add td.isVarType
