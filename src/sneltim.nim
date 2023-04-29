@@ -29,6 +29,7 @@ type
     val: ref T
     prevVal: T
     patchProcs: PatchProcs
+    skipPatchProcs: seq[proc()]
 
 func new[T](v: T): ref T =
   new result
@@ -38,28 +39,33 @@ func newPatchRef[T](val: T): PatchRef[T] =
   new result
   result.val = new val
   new result.patchProcs
+  
+proc add(pps: var PatchProcs, p: proc()) =
+  pps.procs.add PatchProcsNode(isGroup: false, patchProc: p)
 
-func newPatchProc(p: proc()): PatchProcsNode =
-  PatchProcsNode(isGroup: false, patchProc: p)
+proc add(pps: var PatchProcs, g: PatchProcs) =
+  pps.procs.add PatchProcsNode(isGroup: true, group: g)
 
-func newPatchProcGroup(g: PatchProcs): PatchProcsNode = 
-  PatchProcsNode(isGroup: true, group: g)
+proc connect(a,b: var PatchProcs) =
+  a.add b
+  b.add a
 
-proc patch(pps: PatchProcs, visited = newSeq[PatchProcs]()) =
+proc patch(pps: PatchProcs, skip: seq[proc()], visited = newSeq[PatchProcs]()) =
   if pps notin visited:
     var i = 0
     while i < len(pps.procs):
       let pp = pps.procs[i]
       if pp.isGroup:
-        patch pp.group, visited & pps
+        patch pp.group, skip, visited & pps
       else:
-        pp.patchProc()
+        if pp.patchProc notin skip:
+          pp.patchProc()
       inc i
 
 proc patch(pr: PatchRef, init = false) =
   if pr.val[] != pr.prevVal or init:
-    patch pr.patchProcs
     pr.prevVal = pr.val[]
+    patch pr.patchProcs, pr.skipPatchProcs
 
 
 type
@@ -86,6 +92,10 @@ template instanceSeqType[M](c: Component[M]): type = ComponentInstanceSeq[M]
 
 func newComponentInstance[M: Members](pubMembers: M): ComponentInstance[M] =
   result.pubMembers = pubMembers
+
+proc patch(c: ComponentInstance) =
+  for member in c.pubMembers.fields:
+    patch member
 
 
 func getFirstNode*(node: Node): Node {.inline.} = node
@@ -215,7 +225,7 @@ proc componentImpl(
               members.add sym
               initSection.add: quote do:
                 let `ident` = newPatchRef(`defaultVal`)
-              if sym.isExported:
+              if isExported:
                 pubMembers.add newColonExpr(ident, ident)
 
       of nnkProcDef, nnkFuncDef:
@@ -290,9 +300,10 @@ proc componentImpl(
   proc getHookProc(hook: NimNode): NimNode =
     if hook != nil:
       quote do:
-        when `hook` is Node:
-          proc: Node = `hook`
-        else: `hook`.getFirstNode
+        when `hook` is ComponentInstance:
+          `hook`.getFirstNode
+        else:
+          proc: Node = getFirstNode(`hook`)
     else:
       rootGetHookProc
 
@@ -300,22 +311,38 @@ proc componentImpl(
   let mountProc = block:
     var procBody = newStmtList()
 
-    template addPatchProcAndInit(origCode: NimNode, action: untyped) =
+    proc addPatchProcAndInit(origCode: NimNode, action: proc(code: NimNode): NimNode) =
       let memberRefs = getMemberRefs(origCode)[refmAll]
-      let code {.inject.} = origCode.withMemberValAccess
+      let code = origCode.withMemberValAccess
+      let action = action(code)
       if len(memberRefs) == 0:
-        procBody.add: quote do:
-          action
+        procBody.add action
       else:
-        let patchProc {.inject.} = genSym(nskProc, "patch")
+        let patchProc = genSym(nskProc, "patch")
         procBody.add: quote do:
           proc `patchProc` {.closure.} =
-            action
+            `action`
           `patchProc`()
         for i in memberRefs:
-          let member {.inject.} = ident($members[i])
+          let member = ident($members[i])
           procBody.add: quote do:
-            `member`.patchProcs.procs.add newPatchProc(`patchProc`)
+            `member`.patchProcs.add `patchProc`
+
+    proc buildInstanceMemberInit(instance, member, val: NimNode, useType=false): NimNode =
+      result = newStmtList()
+      if val in members:
+        let val = val.unbindSyms
+        result.add: quote do:
+          `instance`.pubMembers.`member`[] = `val`[]
+      else:
+        let unboundVal = val.withMemberValAccess
+        let isVar = not useType or val.isVar
+        result.add: quote do:
+          `instance`.pubMembers.`member`.val = 
+            when `isVar` and compiles(addr `unboundVal`):
+              cast[typeof(`instance`.pubMembers.`member`.val)](addr `unboundVal`)
+            else:
+              new `unboundVal`
 
     proc buildProcBody(templ: Templ, parent: NimNode = nil) =
       var hookElemSym: NimNode
@@ -342,52 +369,99 @@ proc componentImpl(
 
         case elem.kind
         of templText:
-          addPatchProcAndInit elem.text:
+          addPatchProcAndInit(elem.text) do(code: NimNode) -> NimNode: quote do:
             `elemSym`.data = `code`
           mountPlainDomElem()
 
         of templTag:
           for attr, val in elem.attrs:
-            addPatchProcAndInit val:
+            addPatchProcAndInit(val) do(code: NimNode) -> NimNode: quote do:
               `elemSym`.setAttrProperly(`attr`, `code`)
           mountPlainDomElem()
           buildProcBody(elem.childs, parent=elemSym)
 
         of templComponent:
-          # init members
           for name, val in elem.params:
-            let paramIdent = ident(name)
-            if val in members:
-              let val = val.unbindSyms
+            let member = ident(name)
+            procBody.add buildInstanceMemberInit(elemSym, member, val)
+            for i in val.getMemberRefs[refmAll]:
+              let ownMember = members[i].unbindSyms
               procBody.add: quote do:
-                `elemSym`.pubMembers.`paramIdent` = `val`
-            else:
-              let unboundVal = val.withMemberValAccess
-              procBody.add: quote do:
-                `elemSym`.pubMembers.`paramIdent`.val = 
-                  when compiles(addr `unboundVal`):
-                    cast[typeof(`elemSym`.pubMembers.`paramIdent`.val)](addr `unboundVal`)
-                  else:
-                    new `unboundVal`
+                connect `elemSym`.pubMembers.`member`.patchProcs, `ownMember`.patchProcs
 
-              for i in val.getMemberRefs[refmAll]:
-                let member = members[i].unbindSyms
-                procBody.add: quote do:
-                  `elemSym`.pubMembers.`paramIdent`.patchProcs.procs.add newPatchProcGroup(`member`.patchProcs)
-                  `member`.patchProcs.procs.add newPatchProcGroup(`elemSym`.pubMembers.`paramIdent`.patchProcs)
-
-          # mount
-          let getHook = hookElemSym.getHookProc
           let parent =
             if parent == nil: rootParent
             else: parent
+          let getHook = hookElemSym.getHookProc
           procBody.add: quote do:
             `elemSym`.mount(`parent`, `getHook`)
 
         of templFor:
+          let parent =
+            if parent == nil: rootParent
+            else: parent
           let getHook = hookElemSym.getHookProc
           procBody.add: quote do:
             `elemSym`.getHook = `getHook`
+
+          let patchProc = genSym(nskProc, "patch")
+          procBody.add: quote do:
+            proc `patchProc` {.closure.}
+
+          var patchBody = newStmtList()
+          let component = elem.forComponent
+
+          let instanceId = genSym(nskVar, "i")
+          patchBody.add: quote do:
+            var `instanceId` = 0
+
+          var forStmt = elem.forHead.withMemberValAccess
+          var updateLetForMembers = newStmtList()
+          var mountNewInstance = newStmtList: quote do:
+            `elemSym`.instances.add `component`()
+          let instance = quote do:
+            `elemSym`.instances[`instanceId`]
+
+          for forVar in elem.forHead.getForVars:
+            let member = forVar.unbindSyms
+            mountNewInstance.add buildInstanceMemberInit(
+              instance, member, forVar, useType=true)
+            for i in elem.forHead.getMemberRefs[refmAll]:
+              let ownMember = members[i].unbindSyms
+              mountNewInstance.add: quote do:
+                `instance`.pubMembers.`member`.patchProcs.add `ownMember`.patchProcs
+            mountNewInstance.add: quote do:
+              `instance`.pubMembers.`member`.skipPatchProcs.add `patchProc`
+            if not forVar.isVar:
+              updateLetForMembers.add: quote do:
+                `instance`.pubMembers.`member`.val[] = `member`
+
+          for i in elem.forHead.getMemberRefs[refmAll]:
+            let member = members[i].unbindSyms
+            mountNewInstance.add: quote do:
+              `member`.patchProcs.add `patchProc`
+              
+          mountNewInstance.add: quote do:
+            `instance`.mount(`parent`, `elemSym`.getHook)
+          forStmt[^1] = quote do:
+            if `instanceId` < len(`elemSym`.instances):
+              `updateLetForMembers`
+              patch `instance`
+            else:
+              `mountNewInstance`
+            inc `instanceId`
+          patchBody.add forStmt
+
+          patchBody.add: quote do:
+            if `instanceId` < len(`elemSym`.instances):
+              debugEcho "detach instances .."
+              for i in `instanceId` ..< len(`elemSym`.instances):
+                `elemSym`.instances[i].detach()
+              `elemSym`.instances.setLen `instanceId`
+
+          procBody.add: quote do:
+            proc `patchProc` {.closure.} = `patchBody`
+            `patchProc`()
 
         hookElemSym = elemSym
 
@@ -424,6 +498,12 @@ proc componentImpl(
         `rootParent` = nil
 
 
+  let getFirstNodeProc = block:
+    let firstNode = templ[0].sym
+    quote do:
+      proc: Node = `firstNode`.getFirstNode()
+
+
   # ---- assamble ----
 
   result = quote do:
@@ -431,8 +511,10 @@ proc componentImpl(
       `initSection`
       result = newComponentInstance(`pubMembers`)
       result.mount = `mountProc`
+      result.detach = `detachProc`
+      result.getFirstNode = `getFirstNodeProc`
 
-  debugEcho result.repr
+  #debugEcho result.repr
 
 
 

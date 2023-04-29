@@ -75,10 +75,12 @@ proc newTemplTextImpl(s: NimNode): NimNode =
   newCall(bindSym"newTemplText", s)
 
 proc destructureCall(call: NimNode): tuple[callee, attrs, handlers: NimNode] =
-  call.expectKind {nnkCall, nnkIdent, nnkSym}
+  call.expectKind {nnkCall, nnkIdent, nnkSym, nnkAccQuoted}
   result.attrs = nnkTupleConstr.newTree()
   result.handlers = nnkTupleConstr.newTree()
-  if call.kind == nnkCall:
+
+  case call.kind
+  of nnkCall:
     result.callee = call[0]
     if result.callee.kind == nnkAccQuoted:
       result.callee = result.callee[0]
@@ -105,9 +107,9 @@ proc destructureCall(call: NimNode): tuple[callee, attrs, handlers: NimNode] =
       else:
         param[0].expectKind {nnkIdent, nnkSym}
         result.attrs.add nnkExprColonExpr.newTree(param[0], param[1])
-
-  else:
-    result.callee = call
+  
+  of nnkAccQuoted: result.callee = call[0]
+  else:            result.callee = call
 
 proc cosiderCommandSyntax(call, body: NimNode): tuple[call, body: NimNode] =
   if body.kind == nnkEmpty and call.kind == nnkCommand:
@@ -182,9 +184,9 @@ proc parseTempl*(node: NimNode): Templ =
         for event, action in tupleDefToTable(node[3]):
           action.expectKind nnkLambda
           elem.handlers[event] = action[6]
-        if node[4].kind == nnkEmpty: continue
-        node[4].expectKind nnkLambda
-        elem.childs = parseTempl(node[4][6])
+        if node[4].kind != nnkEmpty:
+          node[4].expectKind nnkLambda
+          elem.childs = parseTempl(node[4][6])
 
       of "newTemplComponent":
         node.expectLen 4
