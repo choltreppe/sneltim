@@ -1,4 +1,3 @@
 - if/case in templates
-- slots (passing template body(s) to components)
 - bind (binding to `value` attribute in html-tags, so they get synced automatically)
 - css/scss integration

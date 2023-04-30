@@ -34,6 +34,13 @@ let ntimes = component:
     for _ in 0 ..< n:
       <..>_
 
+let testNamedSlots = component:
+  html:
+    <>b: text "slot a:"; <>br
+    <..>a; <>br
+    <>b: text "slot b:"; <>br
+    <..>b; <>br
+
 
 let testComponent = component:
   var a = 2  # this is a private member (its not visible to parent)
@@ -91,6 +98,12 @@ let testComponent = component:
         <>b text "foo"; <>br
       <%>ntimes(n = listlen1):
         text $listlen0; <>br
+      <%>testNamedSlots:
+        <..>a:
+          text "some content for a"
+        <..>b:
+          text "some content for b"
+
 
 
 run testComponent
