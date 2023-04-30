@@ -74,24 +74,39 @@ type
     for m in ms.fields:
       m is PatchRef
 
-  ComponentInstance[M: Members] = object
+  Slots = concept ss
+    ss is tuple
+    for s in ss.fields:
+      s is BaseComponent
+
+  ComponentInstance[M: Members, S: Slots] = object
     init: proc()
     mount: proc(parent: Node, getHook: proc: Node)
     detach: proc()
     pubMembers: M
+    slots: ref S
     getFirstNode: proc: Node
 
-  ComponentInstanceSeq[M: Members] = object
-    instances: seq[ComponentInstance[M]]
+  ComponentInstanceSeq[M: Members, S: Slots] = object
+    instances: seq[ComponentInstance[M,S]]
     getHook: proc: Node
 
-  Component*[M: Members] = proc: ComponentInstance[M]
+  Component[M: Members, S: Slots] = proc: ComponentInstance[M,S]
 
-template    instanceType[M](c: Component[M]): type =    ComponentInstance[M]
-template instanceSeqType[M](c: Component[M]): type = ComponentInstanceSeq[M]
+  BaseComponent = Component[tuple[], tuple[]]
+  BaseComponentInstance = ComponentInstance[tuple[], tuple[]]
 
-func newComponentInstance[M: Members](pubMembers: M): ComponentInstance[M] =
+let namelessSlotField {.compiletime.} = genSym(nskField, "namelessSlot")
+proc slotFieldName(name: string): NimNode =
+  if name == "_": namelessSlotField
+  else: ident(name)
+
+template    instanceType[M,S](c: Component[M,S]): type =    ComponentInstance[M,S]
+template instanceSeqType[M,S](c: Component[M,S]): type = ComponentInstanceSeq[M,S]
+
+func newComponentInstance[M: Members, S: Slots](pubMembers: M, slots: ref S): ComponentInstance[M,S] =
   result.pubMembers = pubMembers
+  result.slots = slots
 
 proc patch(c: ComponentInstance) =
   for member in c.pubMembers.fields:
@@ -117,7 +132,8 @@ proc setAttrProperly*(node: Node, attr: string, val: auto) =
 proc componentImpl(
   inputInitSection: NimNode,
   templ: Templ,
-  inheritMembers = newSeq[NimNode]()
+  inheritMembers = newSeq[NimNode](),
+  inheritSlots = none(tuple[sym: NimNode, names: HashSet[string]])
 ): NimNode =
 
   # ---- members referencing analysis ----
@@ -238,6 +254,38 @@ proc componentImpl(
   scanBody inputInitSection.undoHiddenNodes
 
 
+  # ---- find slots in template ----
+
+  let (slots, slotNames) = block:
+    if Some(@info) ?= inheritSlots: info
+    else:
+      var slotNames: HashSet[string]
+      proc getSlotNames(templ: Templ) =
+        for elem in templ:
+          case elem.kind
+          of templSlot: slotNames.incl elem.slotName
+          of templTag: getSlotNames elem.childs
+          of templComponent:
+            for body in elem.slots.values: getSlotNames body
+          of templFor: getSlotNames elem.forBody
+          of templText: discard
+      getSlotNames templ
+
+      let slots = genSym(nskLet, "slots")
+      var slotsType = nnkTupleTy.newTree()
+      for name in slotNames:
+        let fieldName = slotFieldName(name)
+        slotsType.add nnkIdentDefs.newTree(
+          fieldName,
+          bindSym"BaseComponent",
+          newEmptyNode()
+        )
+      initSection.add: quote do:
+        let `slots` = new default(`slotsType`)
+
+      (slots, slotNames)
+
+
   # ---- generate elements defenitions ----
 
   proc defElems(templ: Templ) =
@@ -270,6 +318,15 @@ proc componentImpl(
         let component = elem.component
         initSection.add: quote do:
           var `elemSym` = `component`()
+        for name, body in elem.slots:
+          let fieldName = slotFieldName(name)
+          let slotComponent = componentImpl(newStmtList(), body, members, some((slots, slotNames)))
+          initSection.add: quote do:
+            `elemSym`.slots[].`fieldName` = `slotComponent`
+
+      of templSlot:
+        initSection.add: quote do:
+          var `elemSym`: BaseComponentInstance
 
       of templFor:
         var initMembers = newStmtList()
@@ -280,7 +337,7 @@ proc componentImpl(
             else:            newLetStmt(forVar.postfix("*"), val)
 
         let component = elem.forComponent
-        let componentDef = componentImpl(initMembers, elem.forBody, members)
+        let componentDef = componentImpl(initMembers, elem.forBody, members, some((slots, slotNames)))
         initSection.add: quote do:
           let `component` = `componentDef`
           var `elemSym`: instanceSeqType(`component`)
@@ -316,7 +373,7 @@ proc componentImpl(
       let code = origCode.withMemberValAccess
       let action = action(code)
       if len(memberRefs) == 0:
-        procBody.add action
+        initSection.add action
       else:
         let patchProc = genSym(nskProc, "patch")
         procBody.add: quote do:
@@ -346,21 +403,33 @@ proc componentImpl(
 
     proc buildProcBody(templ: Templ, parent: NimNode = nil) =
       var hookElemSym: NimNode
+
       for elem in templ.revItems:
         let elemSym = elem.sym
 
+        let (hook, getHook) =
+          if hookElemSym == nil:
+            if parent == nil: (newCall(rootGetHookProc), rootGetHookProc)
+            else: (
+              newNilLit(),
+              quote do:
+                proc: Node = nil
+            )
+          else: (
+            (quote do: `hookElemSym`.getFirstNode()),
+            quote do:
+              when `hookElemSym` is ComponentInstance:
+                `hookElemSym`.getFirstNode
+              else:
+                proc: Node = getFirstNode(`hookElemSym`)
+          )
+        let parent =
+          if parent == nil: rootParent
+          else: parent
+
         proc mountPlainDomElem =
-          let hook =
-            if hookElemSym == nil:
-              if parent == nil: newCall(rootGetHookProc)
-              else: nil
-            else:
-              quote do: `hookElemSym`.getFirstNode()
-          let parent =
-            if parent == nil: rootParent
-            else: parent
           procBody.add:
-            if hook == nil:
+            if hook.kind == nnkNilLit:
               quote do:
                 `parent`.appendChild(`elemSym`)
             else:
@@ -389,18 +458,18 @@ proc componentImpl(
               procBody.add: quote do:
                 connect `elemSym`.pubMembers.`member`.patchProcs, `ownMember`.patchProcs
 
-          let parent =
-            if parent == nil: rootParent
-            else: parent
-          let getHook = hookElemSym.getHookProc
           procBody.add: quote do:
             `elemSym`.mount(`parent`, `getHook`)
 
+        of templSlot:
+          let fieldName = slotFieldName(elem.slotName)
+          procBody.add: quote do:
+            `elemSym` = `slots`[].`fieldName`()
+            {.emit: ["console.log(", `parent`, ");"].}
+            {.emit: ["console.log(", `getHook`(), ");"].}
+            `elemSym`.mount(`parent`, `getHook`)
+
         of templFor:
-          let parent =
-            if parent == nil: rootParent
-            else: parent
-          let getHook = hookElemSym.getHookProc
           procBody.add: quote do:
             `elemSym`.getHook = `getHook`
 
@@ -483,9 +552,9 @@ proc componentImpl(
           quote do:
             `rootParent`.removeChild(`sym`)
 
-        of templComponent:
+        of templComponent, templSlot:
           quote do:
-              `sym`.detach()
+            `sym`.detach()
 
         of templFor:
           quote do:
@@ -509,12 +578,12 @@ proc componentImpl(
   result = quote do:
     proc: auto =
       `initSection`
-      result = newComponentInstance(`pubMembers`)
+      result = newComponentInstance(`pubMembers`, `slots`)
       result.mount = `mountProc`
       result.detach = `detachProc`
       result.getFirstNode = `getFirstNodeProc`
 
-  #debugEcho result.repr
+  debugEcho result.repr
 
 
 
@@ -543,10 +612,11 @@ macro component*(componentDef: typed): Component =
   if templDef == nil:
     error "no html template defined", componentDef
   let templ = parseTempl(templDef)
+  #debugEcho templ
 
   componentImpl(initSection, templ)
 
 
 
-proc run*(component: Component[tuple[]]) =
+proc run*(component: BaseComponent) =
   component().mount(document.body, proc: Node = nil)

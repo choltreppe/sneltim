@@ -11,19 +11,26 @@ import ./utils
 
 
 type
-  TemplElemKind* = enum templText, templTag, templComponent, templFor
+  TemplElemKind* = enum templText, templTag, templComponent, templSlot, templFor
   TemplElem* = ref object
     sym*: NimNode
     case kind*: TemplElemKind
     of templText:
       text*: NimNode
+
     of templTag:
       tag*: string
       attrs*, handlers*: Table[string, NimNode]
       childs*: seq[TemplElem]
+
     of templComponent:
       component*: NimNode
       params*: Table[string, NimNode]
+      slots*: Table[string, Templ]
+
+    of templSlot:
+      slotName*: string
+
     of templFor:
       forHead*: NimNode
       forBody*: Templ
@@ -53,7 +60,13 @@ func `$`*(templ: Templ, indent = 0): string =
       result.add "<%" & elem.component.repr
       for name, val in elem.params:
         result.add fmt" {name} = {val.repr}"
-      result.add ">"
+      let indentStr = " ".repeat(indent+1)
+      for name, body in elem.slots:
+        result.add &"{indentStr}<..{name}>\n"
+        result.add `$`(body, indent+2)
+        result.add fmt"{indentStr}</..{name}>"
+    of templSlot:
+      result.add fmt"<..{elem.slotName}>"
     of templFor:
       result.add "for " &
         elem.forHead[0 ..< ^2].mapIt(it.repr).join(", ") &
@@ -67,6 +80,7 @@ func `$`*(templ: Templ, indent = 0): string =
 proc newTemplText*(s: string) = discard
 proc newTemplTag*(name: string, params,handlers: tuple, content: proc = nil) = discard
 proc newTemplComponent*(component: proc, params: tuple, content: proc = nil) = discard
+proc newTemplSlot*(name: string, content: proc = nil) = discard
 
 let templDefLabel* {.compiletime.} = genSym(nskLabel, "templDef")
 
@@ -131,7 +145,16 @@ proc newTemplComponentImpl(call: NimNode, body = newEmptyNode()): NimNode =
   if len(handlers) > 0:
     for handler in handlers: error "components dont have event handlers", handler[0]
   callee.expectKind {nnkIdent, nnkSym}
-  newCall(bindSym"newTemplComponent", callee, attrs)
+  result = newCall(bindSym"newTemplComponent", callee, attrs)
+  if body.kind != nnkEmpty:
+    result.add body.denestStmtList
+
+proc newTemplSlotImpl(slot: NimNode, body = newEmptyNode()): NimNode =
+  let (slot, body) = cosiderCommandSyntax(slot, body)
+  slot.expectKind {nnkIdent, nnkSym}
+  result = newCall(bindSym"newTemplSlot", newLit(slot.strVal))
+  if body.kind != nnkEmpty:
+    result.add body.denestStmtList
 
 template templToTypable(blockLabel, templDef: untyped) =
 
@@ -150,6 +173,12 @@ template templToTypable(blockLabel, templDef: untyped) =
   macro `<%>`(call, body: untyped) {.inject.} =
     newTemplComponentImpl(call, body)
 
+  macro `<..>`(call: untyped) {.inject.} =
+    newTemplSlotImpl(call)
+
+  macro `<..>`(call, body: untyped) {.inject.} =
+    newTemplSlotImpl(call, body)
+
   block blockLabel:
     templDef
 
@@ -158,9 +187,9 @@ macro html*(templDef: untyped) =
 
 
 proc tupleDefToTable(tupleDef: NimNode): Table[string, NimNode] =
-  tupleDef.expectKind nnkTupleConstr
+  assert tupleDef.kind == nnkTupleConstr
   for node in tupleDef:
-    node.expectKind nnkExprColonExpr
+    assert node.kind == nnkExprColonExpr
     result[nimIdentNormalize($node[0])] = node[1]
 
 proc parseTempl*(node: NimNode): Templ =
@@ -171,28 +200,50 @@ proc parseTempl*(node: NimNode): Templ =
     of nnkCall:
       case $node[0]
       of "newTemplText":
-        node.expectLen 2
+        assert len(node) == 2
         elem.kind = templText
         elem.text = node[1]
 
       of "newTemplTag":
-        node.expectLen 5
+        assert len(node) == 5
         elem.kind = templTag
-        node[1].expectKind nnkStrLit
+        assert node[1].kind == nnkStrLit
         elem.tag = node[1].strVal
         elem.attrs = tupleDefToTable(node[2])
         for event, action in tupleDefToTable(node[3]):
-          action.expectKind nnkLambda
+          assert action.kind == nnkLambda
           elem.handlers[event] = action[6]
         if node[4].kind != nnkEmpty:
-          node[4].expectKind nnkLambda
+          assert node[4].kind == nnkLambda
           elem.childs = parseTempl(node[4][6])
 
       of "newTemplComponent":
-        node.expectLen 4
+        assert len(node) == 4
         elem.kind = templComponent
         elem.component = node[1]
         elem.params = tupleDefToTable(node[2])
+        if node[3].kind != nnkEmpty:
+          assert node[3].kind == nnkLambda
+          let slots = node[3][6].denestStmtList
+          if slots[0].kind == nnkCall and $slots[0][0] == "newTemplSlot":
+            for slot in slots:
+              slot.expectKind nnkCall
+              assert $slot[0] == "newTemplSlot"
+              assert slot[1].kind == nnkStrLit
+              let slotName = slot[1].strVal
+              assert slot[2].kind == nnkLambda
+              assert slotName notin elem.slots
+              elem.slots[slotName] = parseTempl(slot[2][6])
+          else:
+            elem.slots["_"] = parseTempl(slots)
+
+      of "newTemplSlot":
+        assert len(node) == 3
+        elem.kind = templSlot
+        assert node[1].kind == nnkStrLit
+        elem.slotName = node[1].strVal
+        node[2].expectKind nnkEmpty  #TODO slot defaults
+
 
     of nnkForStmt:
       elem.kind = templFor
