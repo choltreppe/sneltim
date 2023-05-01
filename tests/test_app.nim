@@ -54,6 +54,9 @@ let testComponent = component:
       result += v
 
   html:
+    <%>titledBox(title="binding test (bind a)"):
+      <>input(`type`="text", bind[value]=a)
+
     <%>titledBox(title="basic patching test"):
       <%>editableNum(title="edit a", value=a); <>br
       <%>editableNum(title="edit b", value=b); <>br

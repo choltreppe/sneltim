@@ -20,7 +20,8 @@ type
 
     of templTag:
       tag*: string
-      attrs*, handlers*: Table[string, NimNode]
+      attrs*: Table[string, tuple[val: NimNode, bound: bool]]
+      handlers*: Table[string, NimNode]
       childs*: seq[TemplElem]
 
     of templComponent:
@@ -47,8 +48,10 @@ func `$`*(templ: Templ, indent = 0): string =
       result.add elem.text.repr
     of templTag:
       result.add "<" & elem.tag
-      for name, val in elem.attrs:
-        result.add fmt" {name}=({val.repr})"
+      for name, (val, bound) in elem.attrs:
+        result.add:
+          if bound: fmt" bind[{name}]=({val.repr})"
+          else:     fmt" {name}=({val.repr})"
       for event, action in elem.handlers:
         result.add fmt" on[{event}]=({action.repr})"
       result.add ">"
@@ -88,42 +91,55 @@ let templDefLabel* {.compiletime.} = genSym(nskLabel, "templDef")
 proc newTemplTextImpl(s: NimNode): NimNode =
   newCall(bindSym"newTemplText", s)
 
-proc destructureCall(call: NimNode): tuple[callee, attrs, handlers: NimNode] =
-  call.expectKind {nnkCall, nnkIdent, nnkSym, nnkAccQuoted}
+proc destructureCall(call: NimNode, bindable=true): tuple[callee, attrs, handlers: NimNode] =
+  let call = call.unquote
+  call.expectKind {nnkCall, nnkIdent, nnkSym}
   result.attrs = nnkTupleConstr.newTree()
   result.handlers = nnkTupleConstr.newTree()
 
   case call.kind
   of nnkCall:
-    result.callee = call[0]
-    if result.callee.kind == nnkAccQuoted:
-      result.callee = result.callee[0]
+    result.callee = call[0].unquote
     for param in call[1..^1]:
       param.expectKind nnkExprEqExpr
-      if param[0].kind == nnkBracketExpr:
+      let val = param[1]
+
+      case param[0].kind
+      of nnkBracketExpr:
         param[0].expectLen 2
-        param[0][0].expectKind {nnkIdent, nnkSym}
-        let class = $param[0][0]
-        case class
-        of "on":
+        let class = param[0][0]
+        class.expectKind {nnkIdent, nnkSym}
+        if $class == "on":
           param[0][1].expectKind {nnkIdent, nnkSym}
           result.handlers.add nnkExprColonExpr.newTree(
             param[0][1],
-            nnkLambda.newTree(
-              newEmptyNode(), newEmptyNode(), newEmptyNode(),
-              nnkFormalParams.newTree(newEmptyNode()),
-              newEmptyNode(), newEmptyNode(), 
-              param[1]
-            )
+            quote do:
+              proc = `val`
           )
         else:
-          error fmt"invalid `{class}`"
+          error fmt"invalid `{class}`", class
+
+      of nnkBind:
+        if not bindable:
+          error fmt"cant bind values on component", param[0]
+        param[0][0].expectKind nnkBracket
+        param[0][0].expectLen 1
+        param[0][0][0].expectKind {nnkIdent, nnkSym}
+        result.attrs.add nnkExprColonExpr.newTree(
+          param[0][0][0],
+          quote do: (`val`, true)
+        )
+
       else:
-        param[0].expectKind {nnkIdent, nnkSym}
-        result.attrs.add nnkExprColonExpr.newTree(param[0], param[1])
+        let attr = param[0].unquote
+        attr.expectKind {nnkIdent, nnkSym}
+        result.attrs.add nnkExprColonExpr.newTree(
+          attr,
+          if bindable: quote do: (`val`, false)
+          else: val
+        )
   
-  of nnkAccQuoted: result.callee = call[0]
-  else:            result.callee = call
+  else: result.callee = call
 
 proc cosiderCommandSyntax(call, body: NimNode): tuple[call, body: NimNode] =
   if body.kind == nnkEmpty and call.kind == nnkCommand:
@@ -141,7 +157,7 @@ proc newTemplTagImpl(call: NimNode, body = newEmptyNode()): NimNode =
 
 proc newTemplComponentImpl(call: NimNode, body = newEmptyNode()): NimNode =
   let (call, body) = cosiderCommandSyntax(call, body)
-  let (callee, attrs, handlers) = destructureCall(call)
+  let (callee, attrs, handlers) = destructureCall(call, bindable=false)
   if len(handlers) > 0:
     for handler in handlers: error "components dont have event handlers", handler[0]
   callee.expectKind {nnkIdent, nnkSym}
@@ -192,6 +208,15 @@ proc tupleDefToTable(tupleDef: NimNode): Table[string, NimNode] =
     assert node.kind == nnkExprColonExpr
     result[nimIdentNormalize($node[0])] = node[1]
 
+proc tupleDefToTableAttrs(tupleDef: NimNode): Table[string, (NimNode, bool)] =
+  assert tupleDef.kind == nnkTupleConstr
+  for node in tupleDef:
+    assert node.kind == nnkExprColonExpr
+    assert node[1].kind == nnkTupleConstr
+    assert len(node[1]) == 2
+    assert node[1][1].kind in {nnkIdent, nnkSym}
+    result[nimIdentNormalize($node[0])] = (node[1][0], parseBool($node[1][1]))
+
 proc parseTempl*(node: NimNode): Templ =
   for node in node.denestStmtList.undoHiddenNodes:
     var elem = TemplElem(sym: genSym(nskVar, "elem"))
@@ -209,7 +234,7 @@ proc parseTempl*(node: NimNode): Templ =
         elem.kind = templTag
         assert node[1].kind == nnkStrLit
         elem.tag = node[1].strVal
-        elem.attrs = tupleDefToTable(node[2])
+        elem.attrs = tupleDefToTableAttrs(node[2])
         for event, action in tupleDefToTable(node[3]):
           assert action.kind == nnkLambda
           elem.handlers[event] = action[6]

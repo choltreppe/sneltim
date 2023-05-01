@@ -35,6 +35,10 @@ func denestStmtList*(node: NimNode): NimNode =
   else:
     result = newStmtList(node)
 
+func unquote*(node: NimNode): NimNode =
+  if node.kind == nnkAccQuoted: node[0]
+  else: node
+
 # probably incomplete (i dont realy know the compiler internals)
 func undoHiddenNodes*(node: NimNode): NimNode =
   case node.kind

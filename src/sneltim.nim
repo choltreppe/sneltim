@@ -9,9 +9,9 @@
 
 import std/[macros, genasts, typetraits, sequtils, strutils, setutils, sets, tables, dom, options, enumerate]
 import fusion/matching
-export sets, tables, dom, sequtils
+export dom
 
-import ./private/[templ, utils]
+import sneltim/private/[templ, utils]
 export templ.html
 
 
@@ -127,6 +127,22 @@ proc setAttrProperly*(node: Node, attr: string, val: auto) =
   case attr
   of "value": node.value = val
   else: node.setAttr(attr, val)
+
+proc patchBoundValue[T](bound: var T, node: Node) =
+  let str = $node.value
+  try:
+    bound =
+      when bound is cstring: node.value
+      elif bound is string: str
+      elif bound is int: parseInt(str)
+      elif bound is SomeInteger: parseBiggestInt(str).typeof(bound)
+      elif bound is float: parseFloat(str)
+      elif bound is SomeFloat: parseBiggestInt(str).typeof(bound)
+      else:
+        static: error "invalid type for binding"
+        return
+  except ValueError:
+    node.value = cstring($bound)
 
 
 proc componentImpl(
@@ -301,8 +317,8 @@ proc componentImpl(
         let tag = elem.tag
         initSection.add: quote do:
           var `elemSym` = document.createElement(`tag`)
-        for event, action in elem.handlers:
-          let refs = getMemberRefs(action)[refmMut]
+
+        proc addEventPatching(event: string, refs: seq[int], action: NimNode) =
           let action = action.withMemberValAccess
           var procBody = newStmtList(action)
           for i in refs:
@@ -312,6 +328,19 @@ proc componentImpl(
           initSection.add: quote do:
             `elemSym`.addEventListener(`event`) do (_: Event):
               `procBody`
+
+        for event, action in elem.handlers:
+          addEventPatching(event, getMemberRefs(action)[refmMut], action)
+
+        for name, (val, bound) in elem.attrs:
+          if bound:
+            case name
+            of "value":
+              addEventPatching("input", getMemberRefs(val, varCtx=true)[refmMut]): quote do:
+                patchBoundValue(`val`, `elemSym`)
+            else:
+              error "cant bind "&name, val
+
         defElems elem.childs
 
       of templComponent:
@@ -439,11 +468,11 @@ proc componentImpl(
         case elem.kind
         of templText:
           addPatchProcAndInit(elem.text) do(code: NimNode) -> NimNode: quote do:
-            `elemSym`.data = `code`
+            `elemSym`.data = cstring($`code`)
           mountPlainDomElem()
 
         of templTag:
-          for attr, val in elem.attrs:
+          for attr, (val, _) in elem.attrs:
             addPatchProcAndInit(val) do(code: NimNode) -> NimNode: quote do:
               `elemSym`.setAttrProperly(`attr`, `code`)
           mountPlainDomElem()
@@ -465,8 +494,6 @@ proc componentImpl(
           let fieldName = slotFieldName(elem.slotName)
           procBody.add: quote do:
             `elemSym` = `slots`[].`fieldName`()
-            {.emit: ["console.log(", `parent`, ");"].}
-            {.emit: ["console.log(", `getHook`(), ");"].}
             `elemSym`.mount(`parent`, `getHook`)
 
         of templFor:
@@ -583,7 +610,7 @@ proc componentImpl(
       result.detach = `detachProc`
       result.getFirstNode = `getFirstNodeProc`
 
-  debugEcho result.repr
+  #debugEcho result.repr
 
 
 
