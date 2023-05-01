@@ -75,6 +75,16 @@ let testComponent = component:
         
       <>button(on[click] = (vals &= 0)): text "add val"
       <>button(on[click] = (vals.setLen len(vals) - 1)): text "del val"
+      <>br
+
+      case len(vals)
+      of 0: text "theres no element"
+      of 1: text "theres one element"
+      elif (let v = vals[^1]; v mod 2 == 0):
+        text "the last elem is even"; <>br
+        text "its a " & $v
+      else:
+        text "there is a list"
 
     <%>titledBox(title="matrix"):
 
@@ -97,8 +107,7 @@ let testComponent = component:
         <>b text "listlen0 == 3"; <>br
       elif (let l = listlen0 + listlen1; l < 5):
         <>b text "listlen0 + listlen1 < 5"; <>br;
-        text "to be precise: " & $l; <>br 
-
+        text "to be precise: " & $l; <>br
 
     <%>titledBox(title="some slot tests"):
       <%>twice:

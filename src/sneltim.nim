@@ -123,6 +123,21 @@ proc newComponentInstanceOptions[T: ComponentTuple](options: T): ComponentInstan
   result.options = options
   result.active = -1
 
+proc setActive*(
+  options: var ComponentInstanceOptions,
+  i: static int,
+  parent: Node,
+  getHook: proc: Node
+) =
+  if options.active != i:
+    block detachPrevBranch:
+      for j, o in enumerate(options.options.fields):
+        if j == options.active:
+          o.detach()
+          break detachPrevBranch
+    options.options[i].mount(parent, getHook)
+    options.active = i
+
 proc patch(c: ComponentInstance) =
   for member in c.pubMembers.fields:
     patch member
@@ -236,12 +251,17 @@ proc componentImpl(
           if node in members: node.memberValAccess
           else: node
 
-      of complement(AtomicNodes):
-        result = node.kind.newTree()
+      of AtomicNodes - {nnkSym}: result = node
+
+      of nnkConv:
+        result = nnkCall.newTree()
         for node in node:
           result.add impl(node)
 
-      else: result = node
+      else:
+        result = node.kind.newTree()
+        for node in node:
+          result.add impl(node)
 
     impl(node.undoHiddenNodes)
 
@@ -309,7 +329,9 @@ proc componentImpl(
           of templComponent:
             for body in elem.slots.values: getSlotNames body
           of templFor: getSlotNames elem.forBody
-          of templIf:
+          of templIfCase:
+            if elem.isCaseStmt:
+              for (_, body) in elem.ofBranches: getSlotNames body
             for (_, _, body) in elem.elifBranches: getSlotNames body
             if Some(@body) ?= elem.elseBody: getSlotNames body
           of templText: discard
@@ -399,7 +421,7 @@ proc componentImpl(
           let `component` = `componentDef`
           var `elemSym`: instanceSeqType(`component`)
 
-      of templIf:
+      of templIfCase:
         var options = nnkTupleConstr.newTree()
         proc addOptionComponent(body: Templ, defs = newSeq[NimNode]()) =
           var initMembers = newStmtList()
@@ -411,6 +433,10 @@ proc componentImpl(
           initSection.add: quote do:
             let `component` = `componentDef`
           options.add newCall(component)
+
+        if elem.isCaseStmt:
+          for (_, body) in elem.ofBranches:
+            addOptionComponent body
 
         for (_, defs, body) in elem.elifBranches:
           addOptionComponent body, defs
@@ -609,20 +635,24 @@ proc componentImpl(
             proc `patchProc` {.closure.} = `patchBody`
             `patchProc`()
 
-        of templIf:
-          proc genHandleBranchSwitching(i: int): NimNode =
-            quote do:
-              if `elemSym`.active != `i`:
-                block detachPrevBranch:
-                  for j, o in enumerate(`elemSym`.options.fields):
-                    if j == `elemSym`.active:
-                      o.detach()
-                      break detachPrevBranch
-                `elemSym`.options[`i`].mount(`parent`, `getHook`)
-                `elemSym`.active = `i`
+        of templIfCase:
+          var patchBody =
+            if elem.isCaseStmt: nnkCaseStmt.newTree(elem.caseHead.withMemberValAccess)
+            else: nnkIfStmt.newTree()
 
-          var patchBody = nnkIfStmt.newTree()
-          for i, (cond, defs, _) in elem.elifBranches:
+          var i = 0
+
+          if elem.isCaseStmt:
+            for (matches, _) in elem.ofBranches:
+              var branch = nnkOfBranch.newTree()
+              for match in matches:
+                branch.add match.unbindSyms
+              branch.add: quote do:
+                `elemSym`.setActive(`i`, `parent`, `getHook`)
+              patchBody.add branch
+              inc i
+
+          for (cond, defs, _) in elem.elifBranches:
             var updateMembers = newStmtList()
             for sym in defs:
               let member = sym.unbindSyms
@@ -634,17 +664,24 @@ proc componentImpl(
               cond.withMemberValAccess,
               newStmtList(
                 updateMembers,
-                genHandleBranchSwitching(i)
+                quote do:
+                  `elemSym`.setActive(`i`, `parent`, `getHook`)
               )
             )
+            inc i
 
-          patchBody.add nnkElse.newTree(genHandleBranchSwitching(len(elem.elifBranches)))
+          patchBody.add: nnkElse.newTree: quote do:
+                `elemSym`.setActive(`i`, `parent`, `getHook`)
 
           let patchProc = genSym(nskProc, "patch")
           procBody.add: quote do:
-            proc `patchProc` {.closure.} = `patchBody`
+            proc `patchProc` {.closure.} =
+              debugEcho "patch if/case"
+              `patchBody`
 
           var refs: seq[int]
+          if elem.isCaseStmt:
+            refs.add getMemberRefs(elem.caseHead)[refmAll]
           for (cond, _, _) in elem.elifBranches:
             refs.add getMemberRefs(cond)[refmAll]
           refs = deduplicate(refs)
@@ -685,7 +722,7 @@ proc componentImpl(
             for elem in `elemSym`.instances:
               elem.detach()
 
-        of templIf:
+        of templIfCase:
           quote do:
             for i, o in enumerate(`elemSym`.options.fields):
               if `elemSym`.active == i:
@@ -713,7 +750,7 @@ proc componentImpl(
       result.detach = `detachProc`
       result.getFirstNode = `getFirstNodeProc`
 
-  debugEcho result.repr
+  #debugEcho result.repr
 
 
 

@@ -1,3 +1,3 @@
-- case in templates
 - improve binding
 - css/scss integration
+- error messages

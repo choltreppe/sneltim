@@ -12,7 +12,7 @@ import ./utils
 
 
 type
-  TemplElemKind* = enum templText, templTag, templComponent, templSlot, templFor, templIf
+  TemplElemKind* = enum templText, templTag, templComponent, templSlot, templFor, templIfCase
   TemplElem* = ref object
     sym*: NimNode
     case kind*: TemplElemKind
@@ -38,7 +38,12 @@ type
       forBody*: Templ
       forComponent*: NimNode
 
-    of templIf:
+    of templIfCase:
+      case isCaseStmt*: bool
+      of true:
+        caseHead*: NimNode
+        ofBranches*: seq[tuple[matches: seq[NimNode], body: Templ]]
+      else: discard
       elifBranches*: seq[tuple[cond: NimNode, defs: seq[NimNode], body: Templ]]
       elseBody*: Option[Templ]
 
@@ -88,10 +93,15 @@ func `$`*(templ: Templ, indent = 0): string =
         " in " & elem.forHead[^2].repr & ":\n"
       result.add `$`(elem.forBody, indent+1)
 
-    of templIf:
+    of templIfCase:
+      if elem.isCaseStmt:
+        result.add &"case {elem.caseHead.repr}\n"
+        for (matches, body) in elem.ofBranches:
+          result.add "of " & matches.mapIt(it.repr).join(", ") & ":\n"
+          result.add `$`(body, indent+1)
       for i, (cond, _, body) in elem.elifBranches:
         result.add:
-          if i == 0: "if"
+          if not elem.isCaseStmt and i == 0: "if"
           else: "elif"
         result.add &" {cond.repr}:\n"
         result.add `$`(body, indent+1)
@@ -299,13 +309,23 @@ proc parseTempl*(node: NimNode): Templ =
       elem.forHead = node
       elem.forHead[^1] = newEmptyNode()
 
-    of nnkIfStmt:
-      elem.kind = templIf
-      for branch in node:
-        if branch.kind == nnkElifBranch:
+    of nnkIfStmt, nnkCaseStmt:
+      elem.kind = templIfCase
+      elem.isCaseStmt = node.kind == nnkCaseStmt
+      let branches =
+        if elem.isCaseStmt:
+          elem.caseHead = node[0]
+          node[1..^1]
+        else:
+          node[0..^1]
+      for branch in branches:
+        case branch.kind
+        of nnkOfBranch:
+          elem.ofBranches.add (branch[0 ..< ^1], parseTempl(branch[^1]))
+        of nnkElifBranch:
           elem.elifBranches.add (branch[0], getIfCondDefs(branch[0]), parseTempl(branch[1]))
         else:
-          assert node.kind == nnkElse
+          assert branch.kind == nnkElse
           assert elem.elseBody.isNone
           elem.elseBody = some(parseTempl(branch[0]))
 
