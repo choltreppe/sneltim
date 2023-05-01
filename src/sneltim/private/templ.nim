@@ -6,12 +6,13 @@
 #    distribution, for details about the copyright.
 #
 
-import std/[macros, sequtils, strutils, strformat, tables]
+import std/[macros, sequtils, strutils, strformat, tables, options]
+import fusion/matching
 import ./utils
 
 
 type
-  TemplElemKind* = enum templText, templTag, templComponent, templSlot, templFor
+  TemplElemKind* = enum templText, templTag, templComponent, templSlot, templFor, templIf
   TemplElem* = ref object
     sym*: NimNode
     case kind*: TemplElemKind
@@ -37,15 +38,21 @@ type
       forBody*: Templ
       forComponent*: NimNode
 
+    of templIf:
+      elifBranches*: seq[tuple[cond: NimNode, defs: seq[NimNode], body: Templ]]
+      elseBody*: Option[Templ]
+
   Templ* = seq[TemplElem]
 
 func `$`*(templ: Templ, indent = 0): string =
   let indentStr = " ".repeat(indent)
   for elem in templ:
     result.add indentStr
+
     case elem.kind
     of templText:
       result.add elem.text.repr
+
     of templTag:
       result.add "<" & elem.tag
       for name, (val, bound) in elem.attrs:
@@ -59,22 +66,37 @@ func `$`*(templ: Templ, indent = 0): string =
         result.add "\n"
         result.add `$`(elem.childs, indent+1)
         result.add fmt"{indentStr}</{elem.tag}>"
+
     of templComponent:
       result.add "<%" & elem.component.repr
       for name, val in elem.params:
         result.add fmt" {name} = {val.repr}"
-      let indentStr = " ".repeat(indent+1)
+      result.add ">\n"
+      let subIndentStr = " ".repeat(indent+1)
       for name, body in elem.slots:
-        result.add &"{indentStr}<..{name}>\n"
+        result.add &"{subIndentStr}<..{name}>\n"
         result.add `$`(body, indent+2)
-        result.add fmt"{indentStr}</..{name}>"
+        result.add &"{subIndentStr}</..{name}>\n"
+      result.add indentStr & "</%>"
+
     of templSlot:
       result.add fmt"<..{elem.slotName}>"
+
     of templFor:
       result.add "for " &
         elem.forHead[0 ..< ^2].mapIt(it.repr).join(", ") &
         " in " & elem.forHead[^2].repr & ":\n"
       result.add `$`(elem.forBody, indent+1)
+
+    of templIf:
+      for i, (cond, _, body) in elem.elifBranches:
+        result.add:
+          if i == 0: "if"
+          else: "elif"
+        result.add &" {cond.repr}:\n"
+        result.add `$`(body, indent+1)
+      if Some(@body) ?= elem.elseBody:
+        result.add &"else:\n" & `$`(body, indent+1)
 
     if elem.kind notin {templFor}:
       result.add "\n"
@@ -276,6 +298,16 @@ proc parseTempl*(node: NimNode): Templ =
       elem.forBody.add parseTempl(node[^1])
       elem.forHead = node
       elem.forHead[^1] = newEmptyNode()
+
+    of nnkIfStmt:
+      elem.kind = templIf
+      for branch in node:
+        if branch.kind == nnkElifBranch:
+          elem.elifBranches.add (branch[0], getIfCondDefs(branch[0]), parseTempl(branch[1]))
+        else:
+          assert node.kind == nnkElse
+          assert elem.elseBody.isNone
+          elem.elseBody = some(parseTempl(branch[0]))
 
     else: assert false
 

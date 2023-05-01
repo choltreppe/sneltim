@@ -93,8 +93,12 @@ let testComponent = component:
       <%>editableNum(title="list0", value=listlen0); <>br
       <%>editableNum(title="list1", value=listlen1); <>br
 
-      #if listlen0 == 0:
-      #  <>b text "listlen0 == 0"
+      if listlen0 == 3:
+        <>b text "listlen0 == 3"; <>br
+      elif (let l = listlen0 + listlen1; l < 5):
+        <>b text "listlen0 + listlen1 < 5"; <>br;
+        text "to be precise: " & $l; <>br 
+
 
     <%>titledBox(title="some slot tests"):
       <%>twice:

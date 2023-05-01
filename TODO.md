@@ -1,3 +1,3 @@
-- if/case in templates
-- bind (binding to `value` attribute in html-tags, so they get synced automatically)
+- case in templates
+- improve binding
 - css/scss integration

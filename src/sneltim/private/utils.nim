@@ -84,15 +84,22 @@ func getForVars*(forStmt: NimNode): seq[NimNode] =
       for sym in node: addVar sym
     else: addVar node
 
-func getIfCondBindings*(cond: NimNode): seq[NimNode] =
-  if cond.kind == nnkStmtListExpr:
-    for stmt in cond:
+# get vars/lets defined inside of condition
+func getIfCondDefs*(node: NimNode): seq[NimNode] =
+  case node.kind
+  of nnkStmtListExpr:
+    for stmt in node:
       if stmt.kind in {nnkLetSection, nnkVarSection}:
         for defs in stmt:
           if defs.kind in {nnkIdentDefs, nnkVarTuple}:
             for sym in defs[0 ..< ^2]:
               if $sym != "_":
                 result.add sym
+
+  of AtomicNodes: discard
+  else:
+    for node in node:
+      result.add getIfCondDefs(node)
 
 
 func isVarType(td: NimNode): bool =

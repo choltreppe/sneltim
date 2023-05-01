@@ -80,7 +80,6 @@ type
       s is BaseComponent
 
   ComponentInstance[M: Members, S: Slots] = object
-    init: proc()
     mount: proc(parent: Node, getHook: proc: Node)
     detach: proc()
     pubMembers: M
@@ -91,26 +90,47 @@ type
     instances: seq[ComponentInstance[M,S]]
     getHook: proc: Node
 
+  ComponentTuple = concept cs
+    cs is tuple
+    for c in cs.fields:
+      c is ComponentInstance
+
+  # sadly I didnt find a way to assert the len of the tuple on type-level, concepts seem to not accept generics (?)
+  ComponentInstanceOptions[T: ComponentTuple] = object
+    options: T
+    active: int = -1
+
   Component[M: Members, S: Slots] = proc: ComponentInstance[M,S]
 
   BaseComponent = Component[tuple[], tuple[]]
   BaseComponentInstance = ComponentInstance[tuple[], tuple[]]
 
-let namelessSlotField {.compiletime.} = genSym(nskField, "namelessSlot")
-proc slotFieldName(name: string): NimNode =
-  if name == "_": namelessSlotField
-  else: ident(name)
-
 template    instanceType[M,S](c: Component[M,S]): type =    ComponentInstance[M,S]
 template instanceSeqType[M,S](c: Component[M,S]): type = ComponentInstanceSeq[M,S]
+
+func emptyComponent: BaseComponentInstance =
+  var getHook: proc: Node = nil
+  result.mount = proc(_: Node, h: proc: Node) =
+    getHook = h
+  result.detach = proc = discard
+  result.getFirstNode = getHook
 
 func newComponentInstance[M: Members, S: Slots](pubMembers: M, slots: ref S): ComponentInstance[M,S] =
   result.pubMembers = pubMembers
   result.slots = slots
 
+proc newComponentInstanceOptions[T: ComponentTuple](options: T): ComponentInstanceOptions[T] =
+  result.options = options
+  result.active = -1
+
 proc patch(c: ComponentInstance) =
   for member in c.pubMembers.fields:
     patch member
+
+let namelessSlotField {.compiletime.} = genSym(nskField, "namelessSlot")
+proc slotFieldName(name: string): NimNode =
+  if name == "_": namelessSlotField
+  else: ident(name)
 
 
 func getFirstNode*(node: Node): Node {.inline.} = node
@@ -120,6 +140,11 @@ proc getFirstNode*(s: ComponentInstanceSeq): Node =
     s.instances[0].getFirstNode()
   else:
     s.getHook()
+
+proc getFirstNode*(options: ComponentInstanceOptions): Node =
+  for i, o in enumerate(options.options.fields):
+    if i == options.active:
+      return o.getFirstNode()
 
 
 proc setAttrProperly*(node: Node, attr: string, val: auto) =
@@ -284,6 +309,9 @@ proc componentImpl(
           of templComponent:
             for body in elem.slots.values: getSlotNames body
           of templFor: getSlotNames elem.forBody
+          of templIf:
+            for (_, _, body) in elem.elifBranches: getSlotNames body
+            if Some(@body) ?= elem.elseBody: getSlotNames body
           of templText: discard
       getSlotNames templ
 
@@ -371,6 +399,30 @@ proc componentImpl(
           let `component` = `componentDef`
           var `elemSym`: instanceSeqType(`component`)
 
+      of templIf:
+        var options = nnkTupleConstr.newTree()
+        proc addOptionComponent(body: Templ, defs = newSeq[NimNode]()) =
+          var initMembers = newStmtList()
+          for sym in defs:
+            let val = newCall(bindSym"default", newCall(bindSym"typeof", sym))
+            initMembers.add newLetStmt(sym.postfix("*"), val)
+          let component = genSym(nskLet, "branchComponent")
+          let componentDef = componentImpl(initMembers, body, members, some((slots, slotNames)))
+          initSection.add: quote do:
+            let `component` = `componentDef`
+          options.add newCall(component)
+
+        for (_, defs, body) in elem.elifBranches:
+          addOptionComponent body, defs
+
+        if Some(@body) ?= elem.elseBody:
+          addOptionComponent body
+        else:
+          options.add newCall(bindSym"emptyComponent")
+
+        initSection.add: quote do:
+          var `elemSym` = newComponentInstanceOptions(`options`)
+
   defElems templ
 
 
@@ -457,13 +509,12 @@ proc componentImpl(
           else: parent
 
         proc mountPlainDomElem =
-          procBody.add:
-            if hook.kind == nnkNilLit:
-              quote do:
-                `parent`.appendChild(`elemSym`)
+          procBody.add: quote do:
+            let hook: Node = `hook`
+            if hook == nil:
+              `parent`.appendChild(`elemSym`)
             else:
-              quote do:
-                `parent`.insertBefore(`elemSym`, `hook`)
+              `parent`.insertBefore(`elemSym`, hook)
 
         case elem.kind
         of templText:
@@ -550,13 +601,59 @@ proc componentImpl(
 
           patchBody.add: quote do:
             if `instanceId` < len(`elemSym`.instances):
-              debugEcho "detach instances .."
               for i in `instanceId` ..< len(`elemSym`.instances):
                 `elemSym`.instances[i].detach()
               `elemSym`.instances.setLen `instanceId`
 
           procBody.add: quote do:
             proc `patchProc` {.closure.} = `patchBody`
+            `patchProc`()
+
+        of templIf:
+          proc genHandleBranchSwitching(i: int): NimNode =
+            quote do:
+              if `elemSym`.active != `i`:
+                block detachPrevBranch:
+                  for j, o in enumerate(`elemSym`.options.fields):
+                    if j == `elemSym`.active:
+                      o.detach()
+                      break detachPrevBranch
+                `elemSym`.options[`i`].mount(`parent`, `getHook`)
+                `elemSym`.active = `i`
+
+          var patchBody = nnkIfStmt.newTree()
+          for i, (cond, defs, _) in elem.elifBranches:
+            var updateMembers = newStmtList()
+            for sym in defs:
+              let member = sym.unbindSyms
+              updateMembers.add: quote do:
+                `elemSym`.options[`i`].pubMembers.`member`.val[] = `member`
+                patch `elemSym`.options[`i`].pubMembers.`member`
+
+            patchBody.add nnkElifBranch.newTree(
+              cond.withMemberValAccess,
+              newStmtList(
+                updateMembers,
+                genHandleBranchSwitching(i)
+              )
+            )
+
+          patchBody.add nnkElse.newTree(genHandleBranchSwitching(len(elem.elifBranches)))
+
+          let patchProc = genSym(nskProc, "patch")
+          procBody.add: quote do:
+            proc `patchProc` {.closure.} = `patchBody`
+
+          var refs: seq[int]
+          for (cond, _, _) in elem.elifBranches:
+            refs.add getMemberRefs(cond)[refmAll]
+          refs = deduplicate(refs)
+          for i in refs:
+            let member = members[i].unbindSyms
+            procBody.add: quote do:
+              `member`.patchProcs.add `patchProc`
+
+          procBody.add: quote do:
             `patchProc`()
 
         hookElemSym = elemSym
@@ -572,21 +669,27 @@ proc componentImpl(
   let detachProc = block:
     var procBody = newStmtList()
     for elem in templ:
-      let sym = elem.sym
+      let elemSym = elem.sym
       procBody.add:
         case elem.kind
         of templText, templTag:
           quote do:
-            `rootParent`.removeChild(`sym`)
+            `rootParent`.removeChild(`elemSym`)
 
         of templComponent, templSlot:
           quote do:
-            `sym`.detach()
+            `elemSym`.detach()
 
         of templFor:
           quote do:
-            for elem in `sym`.instances:
+            for elem in `elemSym`.instances:
               elem.detach()
+
+        of templIf:
+          quote do:
+            for i, o in enumerate(`elemSym`.options.fields):
+              if `elemSym`.active == i:
+                o.detach()
 
     quote do:
       proc =
@@ -610,7 +713,7 @@ proc componentImpl(
       result.detach = `detachProc`
       result.getFirstNode = `getFirstNodeProc`
 
-  #debugEcho result.repr
+  debugEcho result.repr
 
 
 
