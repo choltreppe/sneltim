@@ -15,4 +15,4 @@ requires "nim >= 1.9.1"
 task test, "test":
   withDir "tests":
     exec "nim js test_app.nim"
-    #exec "nim js -r test_csstempl.nim"
+    #exec "nim js -r test_style.nim"

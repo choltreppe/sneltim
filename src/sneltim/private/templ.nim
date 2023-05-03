@@ -8,7 +8,8 @@
 
 import std/[macros, sequtils, strutils, strformat, tables, options]
 import fusion/matching
-import ./utils
+import ./utils, ./styles
+export styles
 
 
 type
@@ -24,6 +25,7 @@ type
       attrs*: Table[string, tuple[val: NimNode, bound: bool]]
       handlers*: Table[string, NimNode]
       childs*: seq[TemplElem]
+      style*: Option[tuple[sym,def: NimNode]]
 
     of templComponent:
       component*: NimNode
@@ -36,7 +38,7 @@ type
     of templFor:
       forHead*: NimNode
       forBody*: Templ
-      forComponent*: NimNode
+      forComponentSym*: NimNode
 
     of templIfCase:
       case isCaseStmt*: bool
@@ -113,7 +115,7 @@ func `$`*(templ: Templ, indent = 0): string =
 
 
 proc newTemplText*(s: string) = discard
-proc newTemplTag*(name: string, params,handlers: tuple, content: proc = nil) = discard
+proc newTemplTag*(name: string, params,handlers: tuple, style: Option[Style], content: proc = nil) = discard
 proc newTemplComponent*(component: proc, params: tuple, content: proc = nil) = discard
 proc newTemplSlot*(name: string, content: proc = nil) = discard
 
@@ -180,11 +182,29 @@ proc cosiderCommandSyntax(call, body: NimNode): tuple[call, body: NimNode] =
   else: (call, body)
 
 proc newTemplTagImpl(call: NimNode, body = newEmptyNode()): NimNode =
-  let (call, body) = cosiderCommandSyntax(call, body)
+  let (call, bodyAndStyle) = cosiderCommandSyntax(call, body)
+
   let (callee, attrs, handlers) = destructureCall(call)
   callee.expectKind {nnkIdent, nnkSym}
-  result = newCall(bindSym"newTemplTag", newLit($callee), attrs, handlers)
-  if body.kind != nnkEmpty:
+
+  var body = newStmtList()
+  var styleDef: NimNode
+  for stmt in bodyAndStyle.denestStmtList:
+    if stmt.kind == nnkCall and stmt[0].kind in {nnkIdent, nnkSym} and cmpIgnoreStyle($stmt[0], "style") == 0:
+      stmt.expectLen 2
+      if styleDef != nil:
+        error "cant define multiple styles for one element", stmt
+      styleDef = stmt[1]
+    elif stmt.kind != nnkEmpty:
+      body.add stmt
+  styleDef =
+    if styleDef == nil:
+      quote do: none(Style)
+    else:
+      quote do: some(newStyle(`styleDef`))
+
+  result = newCall(bindSym"newTemplTag", newLit($callee), attrs, handlers, styleDef)
+  if len(body) > 0:
     result.add body.denestStmtList
 
 proc newTemplComponentImpl(call: NimNode, body = newEmptyNode()): NimNode =
@@ -205,30 +225,31 @@ proc newTemplSlotImpl(slot: NimNode, body = newEmptyNode()): NimNode =
     result.add body.denestStmtList
 
 template templToTypable(blockLabel, templDef: untyped) =
+  block:
 
-  macro text(s: string) {.inject.} =
-    newTemplTextImpl(s)
+    macro text(s: string) {.inject.} =
+      newTemplTextImpl(s)
 
-  macro `<>`(call: untyped) {.inject.} =
-    newTemplTagImpl(call)
+    macro `<>`(call: untyped) {.inject.} =
+      newTemplTagImpl(call)
 
-  macro `<>`(call, body: untyped) {.inject.} =
-    newTemplTagImpl(call, body)
+    macro `<>`(call, body: untyped) {.inject.} =
+      newTemplTagImpl(call, body)
 
-  macro `<%>`(call: untyped) {.inject.} =
-    newTemplComponentImpl(call)
+    macro `<%>`(call: untyped) {.inject.} =
+      newTemplComponentImpl(call)
 
-  macro `<%>`(call, body: untyped) {.inject.} =
-    newTemplComponentImpl(call, body)
+    macro `<%>`(call, body: untyped) {.inject.} =
+      newTemplComponentImpl(call, body)
 
-  macro `<..>`(call: untyped) {.inject.} =
-    newTemplSlotImpl(call)
+    macro `<..>`(call: untyped) {.inject.} =
+      newTemplSlotImpl(call)
 
-  macro `<..>`(call, body: untyped) {.inject.} =
-    newTemplSlotImpl(call, body)
+    macro `<..>`(call, body: untyped) {.inject.} =
+      newTemplSlotImpl(call, body)
 
-  block blockLabel:
-    templDef
+    block blockLabel:
+      templDef
 
 macro html*(templDef: untyped) =
   newCall(bindSym"templToTypable", templDefLabel, templDef)
@@ -257,22 +278,31 @@ proc parseTempl*(node: NimNode): Templ =
     of nnkCall:
       case $node[0]
       of "newTemplText":
+        debugEcho node.repr
         assert len(node) == 2
         elem.kind = templText
         elem.text = node[1]
 
       of "newTemplTag":
-        assert len(node) == 5
+        assert len(node) == 6
         elem.kind = templTag
         assert node[1].kind == nnkStrLit
         elem.tag = node[1].strVal
+
         elem.attrs = tupleDefToTableAttrs(node[2])
+
         for event, action in tupleDefToTable(node[3]):
           assert action.kind == nnkLambda
           elem.handlers[event] = action[6]
-        if node[4].kind != nnkEmpty:
-          assert node[4].kind == nnkLambda
-          elem.childs = parseTempl(node[4][6])
+
+        assert node[4].kind == nnkCall
+        assert node[4][0].kind == nnkSym
+        if $node[4][0] == "some":
+          elem.style = some((genSym(nskLet, "style"), node[4][1].removeMacroDefs))
+
+        if node[5].kind != nnkEmpty:
+          assert node[5].kind == nnkLambda
+          elem.childs = parseTempl(node[5][6])
 
       of "newTemplComponent":
         assert len(node) == 4
@@ -304,7 +334,7 @@ proc parseTempl*(node: NimNode): Templ =
 
     of nnkForStmt:
       elem.kind = templFor
-      elem.forComponent = genSym(nskLet, "forComponent")
+      elem.forComponentSym = genSym(nskLet, "forComponent")
       elem.forBody.add parseTempl(node[^1])
       elem.forHead = node
       elem.forHead[^1] = newEmptyNode()
@@ -329,6 +359,8 @@ proc parseTempl*(node: NimNode): Templ =
           assert elem.elseBody.isNone
           elem.elseBody = some(parseTempl(branch[0]))
 
-    else: assert false
+    of nnkEmpty: discard
+
+    else: error "malformed html template", node
 
     result.add elem

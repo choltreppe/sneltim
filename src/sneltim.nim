@@ -13,6 +13,7 @@ export dom
 
 import sneltim/private/[templ, utils]
 export templ.html
+export styles
 
 
 type
@@ -184,19 +185,33 @@ proc patchBoundValue[T](bound: var T, node: Node) =
   except ValueError:
     node.value = cstring($bound)
 
+proc addClass*(node: Node, name: string) =
+  var newClassName = node.class
+  if newClassName != "":
+    newClassName.add " "
+  newClassName.add name
+  node.class = newClassName
+
+
+proc newClassName: string =
+  var i {.global.} = 0
+  result = "sneltim-" & $i
+  inc i
+
+
+type
+  MemberRefKind = enum refmAll, refmMut
+  MemberRefs = array[MemberRefKind, seq[int]]
 
 proc componentImpl(
   inputInitSection: NimNode,
   templ: Templ,
   inheritMembers = newSeq[NimNode](),
+  inheritMemberProcs = newSeq[tuple[sym: NimNode, refs: MemberRefs]](),
   inheritSlots = none(tuple[sym: NimNode, names: HashSet[string]])
 ): NimNode =
 
   # ---- members referencing analysis ----
-
-  type
-    MemberRefKind = enum refmAll, refmMut
-    MemberRefs = array[MemberRefKind, seq[int]]
 
   func add(a: var MemberRefs, b: MemberRefs) =
     for kind in MemberRefKind:
@@ -204,7 +219,7 @@ proc componentImpl(
 
   var
     members = inheritMembers
-    procMemberRefs: seq[tuple[sym: NimNode, refs: MemberRefs]]
+    procMemberRefs = inheritMemberProcs
 
   proc getMemberRefs(node: NimNode, varCtx = false): MemberRefs =
     let node = node.undoHiddenNodes
@@ -216,7 +231,7 @@ proc componentImpl(
           result[refmMut].add i
 
     of nnkCall, nnkCommand, nnkInfix, nnkPrefix:
-      if (let i = procMemberRefs.findIt(node, it[0]); i >= 0):
+      if (let i = procMemberRefs.findIt(node[0], it[0]); i >= 0):
         result.add procMemberRefs[i][1]
       let mut = node[0].paramsMut
       for i, node in node[1..^1]:
@@ -391,6 +406,10 @@ proc componentImpl(
             else:
               error "cant bind "&name, val
 
+        if Some((@styleSym, _)) ?= elem.style:
+          initSection.add: quote do:
+            let `styleSym` = document.createElement("style")
+
         defElems elem.childs
 
       of templComponent:
@@ -399,7 +418,7 @@ proc componentImpl(
           var `elemSym` = `component`()
         for name, body in elem.slots:
           let fieldName = slotFieldName(name)
-          let slotComponent = componentImpl(newStmtList(), body, members, some((slots, slotNames)))
+          let slotComponent = componentImpl(newStmtList(), body, members, procMemberRefs, some((slots, slotNames)))
           initSection.add: quote do:
             `elemSym`.slots[].`fieldName` = `slotComponent`
 
@@ -415,8 +434,8 @@ proc componentImpl(
             if forVar.isVar: newVarStmt(forVar.postfix("*"), val)
             else:            newLetStmt(forVar.postfix("*"), val)
 
-        let component = elem.forComponent
-        let componentDef = componentImpl(initMembers, elem.forBody, members, some((slots, slotNames)))
+        let component = elem.forComponentSym
+        let componentDef = componentImpl(initMembers, elem.forBody, members, procMemberRefs, some((slots, slotNames)))
         initSection.add: quote do:
           let `component` = `componentDef`
           var `elemSym`: instanceSeqType(`component`)
@@ -429,7 +448,7 @@ proc componentImpl(
             let val = newCall(bindSym"default", newCall(bindSym"typeof", sym))
             initMembers.add newLetStmt(sym.postfix("*"), val)
           let component = genSym(nskLet, "branchComponent")
-          let componentDef = componentImpl(initMembers, body, members, some((slots, slotNames)))
+          let componentDef = componentImpl(initMembers, body, members, procMemberRefs, some((slots, slotNames)))
           initSection.add: quote do:
             let `component` = `componentDef`
           options.add newCall(component)
@@ -552,6 +571,18 @@ proc componentImpl(
           for attr, (val, _) in elem.attrs:
             addPatchProcAndInit(val) do(code: NimNode) -> NimNode: quote do:
               `elemSym`.setAttrProperly(`attr`, `code`)
+
+          if Some((@styleSym, @styleDef)) ?= elem.style:
+            let className = genSym(nskLet, "className")
+            initSection.add: quote do:
+              let `className` = newClassName()
+            procBody.add: quote do:
+              `elemSym`.addClass `className`
+              document.head.appendChild(`styleSym`)
+            addPatchProcAndInit(styleDef) do(code: NimNode) -> NimNode: quote do:
+              let styleDef = `code`
+              `styleSym`.innerHtml = render(styleDef, "."&`className`)
+
           mountPlainDomElem()
           buildProcBody(elem.childs, parent=elemSym)
 
@@ -582,7 +613,7 @@ proc componentImpl(
             proc `patchProc` {.closure.}
 
           var patchBody = newStmtList()
-          let component = elem.forComponent
+          let component = elem.forComponentSym
 
           let instanceId = genSym(nskVar, "i")
           patchBody.add: quote do:
@@ -707,26 +738,28 @@ proc componentImpl(
     var procBody = newStmtList()
     for elem in templ:
       let elemSym = elem.sym
-      procBody.add:
-        case elem.kind
-        of templText, templTag:
-          quote do:
-            `rootParent`.removeChild(`elemSym`)
+      case elem.kind
+      of templText, templTag:
+        procBody.add: quote do:
+          `rootParent`.removeChild(`elemSym`)
+        if elem.kind == templTag and (Some((@styleSym, _)) ?= elem.style):
+          procBody.add: quote do:
+            document.head.removeChild(`styleSym`)
 
-        of templComponent, templSlot:
-          quote do:
-            `elemSym`.detach()
+      of templComponent, templSlot:
+        procBody.add: quote do:
+          `elemSym`.detach()
 
-        of templFor:
-          quote do:
-            for elem in `elemSym`.instances:
-              elem.detach()
+      of templFor:
+        procBody.add: quote do:
+          for elem in `elemSym`.instances:
+            elem.detach()
 
-        of templIfCase:
-          quote do:
-            for i, o in enumerate(`elemSym`.options.fields):
-              if `elemSym`.active == i:
-                o.detach()
+      of templIfCase:
+        procBody.add: quote do:
+          for i, o in enumerate(`elemSym`.options.fields):
+            if `elemSym`.active == i:
+              o.detach()
 
     quote do:
       proc =
@@ -750,7 +783,7 @@ proc componentImpl(
       result.detach = `detachProc`
       result.getFirstNode = `getFirstNodeProc`
 
-  #debugEcho result.repr
+  debugEcho result.repr
 
 
 
@@ -767,10 +800,13 @@ macro component*(componentDef: typed): Component =
 
       of nnkMacroDef, nnkTemplateDef: discard
 
-      elif node.kind in {nnkBlockStmt, nnkBlockExpr} and node[0] == templDefLabel:
-        if templDef != nil:
-          error "html template already defined", node
-        templDef = node[1]
+      of nnkBlockStmt, nnkBlockExpr:
+        if node[0] == templDefLabel:
+          if templDef != nil:
+            error "html template already defined", node
+          templDef = node[1]
+        else:
+          scanBody node[1]
 
       else: initSection.add node
   

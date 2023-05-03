@@ -18,7 +18,19 @@ let titledBox = component:
 
   html:
     <>`div`:
-      <>`b` text title; <>br
+      style:
+        --padding: "8px"
+        --margin: "4px"
+        --backgroundColor: "#eee"
+        -:hover:
+          --backgroundColor: "#ccc"
+
+      <>`div`:
+        style:
+          --marginBottom: "3px"
+
+        text title
+      
       <>`div`:
         <..>_
       <>br
@@ -61,7 +73,11 @@ let testComponent = component:
       <%>editableNum(title="edit a", value=a); <>br
       <%>editableNum(title="edit b", value=b); <>br
       text &"a + b = {a+b}"; <>br
-      <>button(on[click] = (inc a; inc b)) text "inc a and b"
+
+      <>button(on[click] = (inc a; inc b)):
+        style:
+          --marginLeft: &"{a*4}px"
+        text "inc a and b"
 
     <%>titledBox(title="loop test"):
       

@@ -39,6 +39,15 @@ func unquote*(node: NimNode): NimNode =
   if node.kind == nnkAccQuoted: node[0]
   else: node
 
+func removeMacroDefs*(node: NimNode): NimNode =
+  case node.kind
+  of nnkMacroDef, nnkTemplateDef: result = newStmtList()
+  of AtomicNodes: result = node
+  else:
+    result = node.kind.newTree()
+    for node in node:
+      result.add node.removeMacroDefs
+
 # probably incomplete (i dont realy know the compiler internals)
 func undoHiddenNodes*(node: NimNode): NimNode =
   case node.kind
