@@ -1,4 +1,5 @@
 import sneltim
+import sneltim/sizes
 import std/[macros, strformat]
 
 
@@ -21,7 +22,7 @@ let titledBox = component:
       style:
         for side in ["left", "top"]:
           padding-{side} := "20px"
-        margin := "4px"
+        margin := 4.px
         backgroundColor := "#eee"
         -:hover:
           backgroundColor := "#ccc"

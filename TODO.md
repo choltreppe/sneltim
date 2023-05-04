@@ -1,2 +1,4 @@
 - improve binding
+- improve sizes module
+- maybe add other style help modules like for color
 - error messages
