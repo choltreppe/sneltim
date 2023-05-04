@@ -55,8 +55,9 @@ func nimIdentToCssAttr(name: string): string =
 
 func render*(style: Style, ctx: string): string =
   result.add ctx & "{"
-  for name, val in style.attrs:
-    result.add name & ":" & val & ";"
+  if len(style.attrs) > 0:
+    for name, val in style.attrs:
+      result.add name & ":" & val & ";"
   result.add "}\n"
 
   for selector in style.selectors:
@@ -68,6 +69,16 @@ func render*(style: Style, ctx: string): string =
         of pseudoElem: "::" & nimIdentToCssAttr($selector.elem)
       )
     )
+
+
+proc merge*(a: var Style, b: Style) =
+  for name, val in b.attrs:
+    a.attrs[name] = val
+  a.selectors.add b.selectors
+
+func merge*(a,b: Style): Style =
+  result = a
+  result.merge b
 
 
 template newStyle*(body: untyped): Style =
@@ -106,8 +117,19 @@ template newStyle*(body: untyped): Style =
       childsDef
       ctx = oldCtx
 
+    proc extendStyle(extend: Style) =
+      style.merge extend
+
+    macro `-@`(name, val: untyped) =
+      name.expectKind {nnkIdent, nnkSym}
+      let cmd = $name
+      case cmd
+      of "extend":
+        newCall(bindSym"extendStyle", val)
+
+      else:
+        error "unknown comand '"&cmd&"'", name
+        return
+
     body
     style
-
-template newStyleTempl*(body: untyped): StyleTempl =
-  proc: Style = newStyle(body)
