@@ -118,6 +118,7 @@ proc newTemplText*(s: string) = discard
 proc newTemplTag*(name: string, params,handlers: tuple, style: Option[Style], content: proc = nil) = discard
 proc newTemplComponent*(component: proc, params: tuple, content: proc = nil) = discard
 proc newTemplSlot*(name: string, content: proc = nil) = discard
+proc newTemplSlotDef*(name: string, content: proc()) = discard
 
 let templDefLabel* {.compiletime.} = genSym(nskLabel, "templDef")
 
@@ -224,6 +225,11 @@ proc newTemplSlotImpl(slot: NimNode, body = newEmptyNode()): NimNode =
   if body.kind != nnkEmpty:
     result.add body.denestStmtList
 
+proc newTemplSlotDefImpl(slot, body: NimNode): NimNode =
+  let (slot, body) = cosiderCommandSyntax(slot, body)
+  slot.expectKind {nnkIdent, nnkSym}
+  newCall(bindSym"newTemplSlotDef", newLit(slot.strVal), body.denestStmtList)
+
 template templToTypable(blockLabel, templDef: untyped) =
   block:
 
@@ -247,6 +253,9 @@ template templToTypable(blockLabel, templDef: untyped) =
 
     macro `<..>`(call, body: untyped) {.inject.} =
       newTemplSlotImpl(call, body)
+
+    macro `<=>`(call, body: untyped) {.inject.} =
+      newTemplSlotDefImpl(call, body)
 
     block blockLabel:
       templDef
@@ -312,10 +321,10 @@ proc parseTempl*(node: NimNode): Templ =
         if node[3].kind != nnkEmpty:
           assert node[3].kind == nnkLambda
           let slots = node[3][6].denestStmtList
-          if slots[0].kind == nnkCall and $slots[0][0] == "newTemplSlot":
+          if slots[0].kind == nnkCall and $slots[0][0] == "newTemplSlotDef":
             for slot in slots:
               slot.expectKind nnkCall
-              assert $slot[0] == "newTemplSlot"
+              assert $slot[0] == "newTemplSlotDef"
               assert slot[1].kind == nnkStrLit
               let slotName = slot[1].strVal
               assert slot[2].kind == nnkLambda

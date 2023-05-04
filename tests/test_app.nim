@@ -131,9 +131,9 @@ let testComponent = component:
       <%>ntimes(n = listlen1):
         text $listlen0; <>br
       <%>testNamedSlots:
-        <..>a:
+        <=>a:
           text "some content for a"
-        <..>b:
+        <=>b:
           text "some content for b"
 
 
