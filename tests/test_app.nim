@@ -19,15 +19,16 @@ let titledBox = component:
   html:
     <>`div`:
       style:
-        --padding: "8px"
-        --margin: "4px"
-        --backgroundColor: "#eee"
+        for side in ["left", "top"]:
+          padding-{side} := "20px"
+        margin := "4px"
+        backgroundColor := "#eee"
         -:hover:
-          --backgroundColor: "#ccc"
+          backgroundColor := "#ccc"
 
       <>`div`:
         style:
-          --marginBottom: "3px"
+          marginBottom := "3px"
 
         text title
       
@@ -76,7 +77,7 @@ let testComponent = component:
 
       <>button(on[click] = (inc a; inc b)):
         style:
-          --marginLeft: &"{a*4}px"
+          marginLeft := &"{a*4}px"
         text "inc a and b"
 
     <%>titledBox(title="loop test"):

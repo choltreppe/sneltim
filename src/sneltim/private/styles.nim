@@ -81,6 +81,23 @@ func merge*(a,b: Style): Style =
   result.merge b
 
 
+proc parseAttrNameTempl(node: NimNode): NimNode =
+  case node.kind
+  of nnkInfix:
+    assert $node[0] == "-"
+    infix(infix(
+      parseAttrNameTempl(node[1]), "&",
+      newLit"-"), "&",
+      parseAttrNameTempl(node[2])
+    )
+  of nnkCurly:
+    node.expectLen 1
+    node[0]
+  else:
+    node.expectKind {nnkIdent, nnkSym}
+    newLit(nimIdentToCssAttr($node))
+
+
 template newStyle*(body: untyped): Style =
   block:
 
@@ -90,10 +107,8 @@ template newStyle*(body: untyped): Style =
     proc setAttr(name, val: string) =
       ctx.attrs[name] = val
 
-    macro `--`(name: untyped, val: string) =
-      name.expectKind {nnkIdent, nnkSym}
-      let name = nimIdentToCssAttr($name)
-      newCall(bindSym"setAttr", newLit(nimIdentToCssAttr($name)), val)
+    macro `:=`(name: untyped, val: string) =
+      newCall(bindSym"setAttr", parseAttrNameTempl(name), val)
 
     proc newPseudoClassCtx(classDef: PseudoClass) =
       let newCtx = Style()
