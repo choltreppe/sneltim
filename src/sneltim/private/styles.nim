@@ -108,7 +108,7 @@ template newStyle*(body: untyped): Style =
       ctx.attrs[name] = val
 
     macro `:=`(name, val: untyped) =
-      newCall(bindSym"setAttr", parseAttrNameTempl(name), val.prefix("$"))
+      newCall(bindSym"setAttr", parseAttrNameTempl(name), macros.prefix(val, "$"))
 
     proc newPseudoClassCtx(classDef: PseudoClass) =
       let newCtx = Style()

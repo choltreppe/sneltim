@@ -7,7 +7,7 @@
 #
 
 
-import std/[macros, genasts, typetraits, sequtils, strutils, setutils, sets, tables, dom, options, enumerate]
+import std/[macros, genasts, typetraits, sugar, sequtils, strutils, setutils, sets, tables, dom, options, enumerate]
 import fusion/matching
 export dom
 
@@ -204,6 +204,7 @@ type
   MemberRefs = array[MemberRefKind, seq[int]]
 
 proc componentImpl(
+  pubMemberDefs: seq[tuple[sym, default: NimNode]],
   inputInitSection: NimNode,
   templ: Templ,
   inheritMembers = newSeq[NimNode](),
@@ -287,45 +288,33 @@ proc componentImpl(
     initSection = newStmtList()
     pubMembers = nnkTupleConstr.newTree()
 
+  for (sym, default) in pubMemberDefs:
+    members.add sym
+    let ident = sym.unbindSyms
+    pubMembers.add newColonExpr(ident, ident)
+    initSection.add: quote do:
+      let `ident` = newPatchRef(`default`)
+
   proc scanBody(node: NimNode) =
     for node in node.denestStmtList:
       case node.kind
       of nnkStmtList, nnkStmtListExpr: scanBody node
 
-      of nnkVarSection, nnkLetSection:
-        let isVar = node.kind == nnkVarSection
-
+      of nnkVarSection:
         for defs in node:
-          let defaultVal =
-            if defs[^1].kind == nnkEmpty:
-              newCall(bindSym"default", defs[^2].unbindSyms)
-            else: defs[^1]
-
           for sym in defs[0 ..< ^2]:
-            let (sym, isExported) =
-              if sym.kind == nnkPostfix:
-                assert $sym[0] == "*"
-                (sym[1], true)
-              else:
-                (sym, sym.isExported)
-            let ident = ident($sym)
-
-            if not (isExported or isVar):
-              initSection.add: quote do:
-                let `ident` = `defaultVal`
-            else:
-              members.add sym
-              initSection.add: quote do:
-                let `ident` = newPatchRef(`defaultVal`)
-              if isExported:
-                pubMembers.add newColonExpr(ident, ident)
+            members.add sym
+            let ident = sym.unbindSyms
+            let defaultVal = defs.defsGetVal.withMemberValAccess
+            initSection.add: quote do:
+              let `ident` = newPatchRef(`defaultVal`)
 
       of nnkProcDef, nnkFuncDef:
         procMemberRefs.add (node[0], getMemberRefs(node))
         initSection.add node.withMemberValAccess
 
       else:
-        initSection.add node
+        initSection.add node.withMemberValAccess
 
   scanBody inputInitSection.undoHiddenNodes
 
@@ -418,39 +407,35 @@ proc componentImpl(
           var `elemSym` = `component`()
         for name, body in elem.slots:
           let fieldName = slotFieldName(name)
-          let slotComponent = componentImpl(newStmtList(), body, members, procMemberRefs, some((slots, slotNames)))
+          let slotComponent = componentImpl(@[], newStmtList(), body, members, procMemberRefs, some((slots, slotNames)))
           initSection.add: quote do:
-            `elemSym`.slots[].`fieldName` = `slotComponent`
+            `elemSym`.slots[].`fieldName` = proc: auto = `slotComponent`
 
       of templSlot:
         initSection.add: quote do:
           var `elemSym`: BaseComponentInstance
 
       of templFor:
-        var initMembers = newStmtList()
-        for forVar in elem.forHead.getForVars:
-          let val = newCall(bindSym"default", newCall(bindSym"typeof", forVar))
-          initMembers.add:
-            if forVar.isVar: newVarStmt(forVar.postfix("*"), val)
-            else:            newLetStmt(forVar.postfix("*"), val)
+        let forMembers: seq[tuple[sym, default: NimNode]] = collect:
+          for forVar in elem.forHead.getForVars:
+            (forVar, newCall(bindSym"default", newCall(bindSym"typeof", forVar)))
 
         let component = elem.forComponentSym
-        let componentDef = componentImpl(initMembers, elem.forBody, members, procMemberRefs, some((slots, slotNames)))
+        let componentDef = componentImpl(forMembers, newStmtList(), elem.forBody, members, procMemberRefs, some((slots, slotNames)))
         initSection.add: quote do:
-          let `component` = `componentDef`
+          let `component` = proc: auto = `componentDef`
           var `elemSym`: instanceSeqType(`component`)
 
       of templIfCase:
         var options = nnkTupleConstr.newTree()
         proc addOptionComponent(body: Templ, defs = newSeq[NimNode]()) =
-          var initMembers = newStmtList()
-          for sym in defs:
-            let val = newCall(bindSym"default", newCall(bindSym"typeof", sym))
-            initMembers.add newLetStmt(sym.postfix("*"), val)
-          let component = genSym(nskLet, "branchComponent")
-          let componentDef = componentImpl(initMembers, body, members, procMemberRefs, some((slots, slotNames)))
+          let ifMembers: seq[tuple[sym, default: NimNode]] = collect:
+            for sym in defs:
+              (sym, newCall(bindSym"default", newCall(bindSym"typeof", sym)))
+          let component = genSym(nskProc, "branchComponent")
+          let componentDef = componentImpl(ifMembers, newStmtList(), body, members, procMemberRefs, some((slots, slotNames)))
           initSection.add: quote do:
-            let `component` = `componentDef`
+            proc `component`: auto = `componentDef`
           options.add newCall(component)
 
         if elem.isCaseStmt:
@@ -776,23 +761,33 @@ proc componentImpl(
   # ---- assamble ----
 
   result = quote do:
-    proc: auto =
-      `initSection`
-      result = newComponentInstance(`pubMembers`, `slots`)
-      result.mount = `mountProc`
-      result.detach = `detachProc`
-      result.getFirstNode = `getFirstNodeProc`
+    `initSection`
+    result = newComponentInstance(`pubMembers`, `slots`)
+    result.mount = `mountProc`
+    result.detach = `detachProc`
+    result.getFirstNode = `getFirstNodeProc`
 
+  #debugEcho "\n\n\n"
   debugEcho result.repr
 
 
 
-macro component*(componentDef: typed): Component =
+macro component*(procDef: typed): untyped =
+
+  procDef.expectKind {nnkProcDef, nnkFuncDef}
+
+  let params = procDef.params
+  params[0].expectKind nnkEmpty
+  var pubMembers: seq[tuple[sym, default: NimNode]]
+  for param in params[1..^1]:
+    let defaultVal = param.defsGetVal.unbindSyms
+    for sym in param[0 ..< ^2]:
+      pubMembers.add (sym, defaultVal)
 
   var
     initSection = newStmtList()
     templDef: NimNode
-
+  
   proc scanBody(node: NimNode) =
     for node in node.denestStmtList.undoHiddenNodes:
       case node.kind
@@ -810,14 +805,17 @@ macro component*(componentDef: typed): Component =
 
       else: initSection.add node
   
-  scanBody componentDef
+  scanBody procDef.body
 
   if templDef == nil:
-    error "no html template defined", componentDef
+    error "no html template defined", procDef
   let templ = parseTempl(templDef)
   #debugEcho templ
 
-  componentImpl(initSection, templ)
+  let componentBody = componentImpl(pubMembers, initSection, templ)
+  let componentName = procDef.name
+  quote do:
+    proc `componentName`: auto = `componentBody`
 
 
 

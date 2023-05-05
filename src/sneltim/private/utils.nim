@@ -120,3 +120,15 @@ func isVar*(node: NimNode): bool =
 func paramsMut*(node: NimNode): seq[bool] =
   for td in node.getType[2..^1]:
     result.add td.isVarType
+
+
+func defsGetVal*(defs: NimNode): NimNode =
+  defs.expectKind nnkIdentDefs
+  if defs[^1].kind == nnkEmpty:
+    let td = defs[^2]
+    newCall(
+      bindSym"default",
+      if td.kind == nnkVarTy: td[0]
+      else: td
+    )
+  else: defs[^1]

@@ -182,28 +182,28 @@ proc cosiderCommandSyntax(call, body: NimNode): tuple[call, body: NimNode] =
     (call[0], call[1])
   else: (call, body)
 
-proc newTemplTagImpl(call: NimNode, body = newEmptyNode()): NimNode =
-  let (call, bodyAndStyle) = cosiderCommandSyntax(call, body)
-
-  let (callee, attrs, handlers) = destructureCall(call)
-  callee.expectKind {nnkIdent, nnkSym}
-
-  var body = newStmtList()
-  var styleDef: NimNode
-  for stmt in bodyAndStyle.denestStmtList:
+proc extractStyleDef(body: NimNode): tuple[body, styleDef: NimNode] =
+  result.body = newStmtList()
+  for stmt in body.denestStmtList:
     if stmt.kind == nnkCall and stmt[0].kind in {nnkIdent, nnkSym} and cmpIgnoreStyle($stmt[0], "style") == 0:
       stmt.expectLen 2
-      if styleDef != nil:
+      if result.styleDef != nil:
         error "cant define multiple styles for one element", stmt
-      styleDef = stmt[1]
+      result.styleDef = stmt[1]
     elif stmt.kind != nnkEmpty:
-      body.add stmt
-  styleDef =
-    if styleDef == nil:
+      result.body.add stmt
+  result.styleDef =
+    if result.styleDef == nil:
       quote do: none(Style)
     else:
+      let styleDef = result.styleDef
       quote do: some(newStyle(`styleDef`))
 
+proc newTemplTagImpl(call: NimNode, body = newEmptyNode()): NimNode =
+  let (call, bodyAndStyle) = cosiderCommandSyntax(call, body)
+  let (callee, attrs, handlers) = destructureCall(call)
+  callee.expectKind {nnkIdent, nnkSym}
+  let (body, styleDef) = extractStyleDef(bodyAndStyle)
   result = newCall(bindSym"newTemplTag", newLit($callee), attrs, handlers, styleDef)
   if len(body) > 0:
     result.add body.denestStmtList
@@ -287,7 +287,6 @@ proc parseTempl*(node: NimNode): Templ =
     of nnkCall:
       case $node[0]
       of "newTemplText":
-        debugEcho node.repr
         assert len(node) == 2
         elem.kind = templText
         elem.text = node[1]

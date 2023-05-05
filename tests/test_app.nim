@@ -1,12 +1,9 @@
 import sneltim
 import sneltim/sizes
-import std/[macros, strformat]
+import std/[strformat]
 
 
-let editableNum = component:
-  let title* = ""  # this is a public let member (it can only be set (and changed) from parent)
-  var value*: int  # this is a public var member (it can be set from parent and self, and chnages from self effect parent)
-
+proc editableNum(title: string, value: var int) {.component.} =
   html:
     text title & ":"
     <>button(on[click] = dec value): text "-"
@@ -14,9 +11,7 @@ let editableNum = component:
     <>button(on[click] = inc value): text "+"
 
 
-let titledBox = component:
-  let title* = ""
-
+proc titledBox(title: string) {.component.} =
   html:
     <>`div`:
       style:
@@ -37,18 +32,18 @@ let titledBox = component:
         <..>_
       <>br
 
-let twice = component:
+
+proc twice {.component.} =
   html:
     <..>_
     <..>_
 
-let ntimes = component:
-  let n* = 1
+proc ntimes(n = 1) {.component.} =
   html:
     for _ in 0 ..< n:
       <..>_
 
-let testNamedSlots = component:
+proc testNamedSlots {.component.} =
   html:
     <>b: text "slot a:"; <>br
     <..>a; <>br
@@ -56,7 +51,7 @@ let testNamedSlots = component:
     <..>b; <>br
 
 
-let testComponent = component:
+proc testComponent {.component.} =
   var a = 2  # this is a private member (its not visible to parent)
   var b = 3
   var vals = @[1, 2, 3]
@@ -68,6 +63,7 @@ let testComponent = component:
       result += v
 
   html:
+    
     <%>titledBox(title="binding test (bind a)"):
       <>input(`type`="text", bind[value]=a)
 
