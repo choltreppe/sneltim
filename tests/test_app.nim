@@ -12,19 +12,23 @@ proc editableNum[T](title: string, value: var T) {.component.} =
 
 
 proc titledBox(title: string) {.component.} =
+
+  let styleForTestingExtend = newStyle:
+    backgroundColor: "#eee"
+
   html:
     <>`div`:
       style:
+        -@extend: styleForTestingExtend
         for side in ["left", "top"]:
-          padding-{side} := "20px"
-        margin := 4.px
-        backgroundColor := "#eee"
+          (padding-{side}): "20px"
+        margin: 4.px
         -:hover:
-          backgroundColor := "#ccc"
+          backgroundColor: "#ccc"
 
       <>`div`:
         style:
-          marginBottom := "3px"
+          marginBottom: "3px"
 
         text title
       
@@ -74,11 +78,18 @@ proc testComponent {.component.} =
     <%>titledBox(title="basic patching test"):
       <%>editableNum[float](title="edit a", value=a); <>br
       <%>editableNum[float](title="edit b", value=b); <>br
-      text &"a + b = {a+b}"; <>br
+      <>span:
+        style:
+          if a+b < 0.0:
+            color: "#880000"
+          elif a+b > 3.0:
+            backgroundColor: "#aaffdd"
+        text &"a + b = {a+b}"
+      <>br
 
       <>button(on[click] = (a += 0.5; b += 0.5)):
         style:
-          marginLeft := &"{a*4}px"
+          marginLeft: &"{a*4}px"
         text "inc a and b by 0.5"
 
     <%>titledBox(title="loop test"):

@@ -7,6 +7,7 @@
 #
 
 import std/[macros, strutils, tables]
+import ./utils
 export tables
 
 
@@ -33,15 +34,15 @@ type
 
   SelectorKind = enum pseudoClass, pseudoElem
 
-  Selector = object
-    case kind: SelectorKind
-    of pseudoClass: class: PseudoClass
-    of pseudoElem: elem: PseudoElem
-    childs: Style
+  Selector* = object
+    case kind*: SelectorKind
+    of pseudoClass: class*: PseudoClass
+    of pseudoElem: elem*: PseudoElem
+    childs*: Style
 
   Style* = ref object
-    attrs: OrderedTable[string, string]
-    selectors: seq[Selector]
+    attrs*: OrderedTable[string, string]
+    selectors*: seq[Selector]
 
   StyleTempl* = proc: Style
 
@@ -81,70 +82,103 @@ func merge*(a,b: Style): Style =
   result.merge b
 
 
-proc parseAttrNameTempl(node: NimNode): NimNode =
-  case node.kind
-  of nnkInfix:
-    assert $node[0] == "-"
-    infix(infix(
-      parseAttrNameTempl(node[1]), "&",
-      newLit"-"), "&",
-      parseAttrNameTempl(node[2])
-    )
-  of nnkCurly:
-    node.expectLen 1
-    node[0]
-  else:
-    node.expectKind {nnkIdent, nnkSym}
-    newLit(nimIdentToCssAttr($node))
 
 
-template newStyle*(body: untyped): Style =
-  block:
 
-    var style = Style()
-    var ctx = style
+macro newStyle*(body: untyped): Style =
 
-    proc setAttr(name, val: string) =
-      ctx.attrs[name] = val
+  proc parseAttrNameTempl(node: NimNode): NimNode =
+    case node.kind
+    of nnkPar: parseAttrNameTempl(node[0])
+    of nnkInfix:
+      assert $node[0] == "-"
+      infix(infix(
+        parseAttrNameTempl(node[1]), "&",
+        newLit"-"), "&",
+        parseAttrNameTempl(node[2])
+      )
+    of nnkCurly:
+      node.expectLen 1
+      node[0]
+    else:
+      node.expectKind {nnkIdent, nnkSym}
+      newLit(nimIdentToCssAttr($node))
 
-    macro `:=`(name, val: untyped) =
-      newCall(bindSym"setAttr", parseAttrNameTempl(name), macros.prefix(val, "$"))
+  proc parseStyle(node: NimNode): NimNode =
+    let style = genSym(nskVar, "style")
 
-    proc newPseudoClassCtx(classDef: PseudoClass) =
-      let newCtx = Style()
-      ctx.selectors.add Selector(kind: pseudoClass, class: classDef, childs: newCtx)
-      ctx = newCtx
+    proc parseBody(node: NimNode): NimNode =
+      result = newStmtList()
+      for node in node.denestStmtList:
+        result.add:
+          case node.kind
+          of nnkCall:
+            node.expectLen 2
+            let name = parseAttrNameTempl(node[0])
+            let val = node[1]
+            quote do:
+              `style`.attrs[`name`] = $`val`
 
-    template `-:`(classDef: PseudoClass, childsDef: untyped) =
-      let oldCtx = ctx
-      newPseudoClassCtx classDef
-      childsDef
-      ctx = oldCtx
+          of nnkPrefix:
+            node.expectLen 3
+            let name = node[1]
 
-    proc newPseudoElemCtx(elemDef: PseudoElem) =
-      let newCtx = Style()
-      ctx.selectors.add Selector(kind: pseudoElem, elem: elemDef, childs: newCtx)
-      ctx = newCtx
+            proc addSelector(kind: SelectorKind, fieldName: string): NimNode =
+              let field = ident(fieldName)
+              let childs = parseStyle(node[2])
+              quote do:
+                `style`.selectors.add Selector(
+                  kind: `kind`,
+                  `field`: `name`,
+                  childs: `childs`
+                )
 
-    template `-::`(elemDef: PseudoElem, childsDef: untyped) =
-      let oldCtx = ctx
-      newPseudoElemCtx elemDef
-      childsDef
-      ctx = oldCtx
+            case $node[0]
+            of "-:":  addSelector(pseudoClass, "class")
+            of "-::": addSelector(pseudoElem , "elem" )
 
-    proc extendStyle(extend: Style) =
-      style.merge extend
+            of "-@":
+              name.expectKind {nnkIdent, nnkSym}
+              let cmd = $name
+              let extend = node[2]
+              case cmd
+              of "extend":
+                quote do:
+                  `style`.merge `extend`
 
-    macro `-@`(name, val: untyped) =
-      name.expectKind {nnkIdent, nnkSym}
-      let cmd = $name
-      case cmd
-      of "extend":
-        newCall(bindSym"extendStyle", val)
+              else:
+                error "unknown comand '"&cmd&"'", name
+                break
 
-      else:
-        error "unknown comand '"&cmd&"'", name
-        return
+            else:
+              error "unexpected '" & $node[0] & "'", node[0]
+              break
 
-    body
-    style
+          of nnkLetSection, nnkVarSection: node
+
+          of nnkForStmt:
+            node[^1] = parseBody(node[^1])
+            node
+
+          of nnkIfStmt:
+            for branch in node:
+              branch[^1] = parseBody(branch[^1])
+            node
+
+          of nnkCaseStmt:
+            for branch in node[1..^1]:
+              branch[^1] = parseBody(branch[^1])
+            node
+
+          else:
+            error "unexpected", node
+            break
+
+    let body = parseBody(node)
+    quote do:
+      var `style` = Style()
+      `body`
+      `style`
+
+  result = parseStyle(body)
+  debugEcho result.repr

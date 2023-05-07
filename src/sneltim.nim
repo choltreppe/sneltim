@@ -33,7 +33,7 @@ type
       patchProc: proc()
 
 func new[T](v: T): ref T =
-  new result
+  result = new(T)
   result[] = v
 
 func newPatchRef[T](val: T = default(T)): PatchRef[T] =
@@ -303,12 +303,12 @@ proc componentBodyImpl(
           let td = defs[^2]
           let defaultVal = defs[^1].withMemberValAccess
           for sym in defs[0 ..< ^2]:
-            members.add sym
             let ident = sym.unbindSyms
             let isPub = $sym in pubMemberNames
             if isPub:
               pubMembers.add newColonExpr(ident, ident)
             if isPub or isVar:
+              members.add sym
               var newPatchRefCall =
                 if td.kind == nnkEmpty:
                   quote do: newPatchRef()
@@ -384,15 +384,16 @@ proc componentBodyImpl(
         initSection.add: quote do:
           var `elemSym` = document.createElement(`tag`)
 
-        proc addEventPatching(event: string, refs: seq[int], action: NimNode) =
+        proc addEventPatching(eventName: string, refs: seq[int], action: NimNode) =
           let action = action.withMemberValAccess
           var procBody = newStmtList(action)
           for i in refs:
             let member = ident($members[i])
             procBody.add: quote do:
               patch `member`
+          let event = ident"event"
           initSection.add: quote do:
-            `elemSym`.addEventListener(`event`) do (_: Event):
+            `elemSym`.addEventListener(`eventName`) do (`event`: Event):
               `procBody`
 
         for event, action in elem.handlers:
@@ -735,7 +736,7 @@ proc componentBodyImpl(
           let patchProc = genSym(nskProc, "patch")
           procBody.add: quote do:
             proc `patchProc` {.closure.} =
-              debugEcho "patch if/case"
+              #debugEcho "patch if/case"
               `patchBody`
 
           var refs: seq[int]
@@ -817,8 +818,8 @@ proc componentBodyImpl(
     instance.getFirstNode = `getFirstNodeProc`
     instance
 
-  debugEcho "\n\n\n"
-  debugEcho result.repr
+  #debugEcho "\n\n\n"
+  #debugEcho result.repr
 
 
 macro componentBody(pubMemberNames: static seq[string], body: typed): ComponentInstance =
