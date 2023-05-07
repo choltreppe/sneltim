@@ -1,14 +1,14 @@
 import sneltim
 import sneltim/sizes
-import std/[strformat]
+import std/[strformat, macros]
 
 
-proc editableNum(title: string, value: var int) {.component.} =
+proc editableNum[T](title: string, value: var T) {.component.} =
   html:
     text title & ":"
-    <>button(on[click] = dec value): text "-"
+    <>button(on[click] = (value -= 1)): text "-"
     text $value
-    <>button(on[click] = inc value): text "+"
+    <>button(on[click] = (value += 1)): text "+"
 
 
 proc titledBox(title: string) {.component.} =
@@ -52,13 +52,13 @@ proc testNamedSlots {.component.} =
 
 
 proc testComponent {.component.} =
-  var a = 2  # this is a private member (its not visible to parent)
-  var b = 3
+  var a = 2.0
+  var b = 3.0
   var vals = @[1, 2, 3]
   var matrix: array[3, array[3, int]]
   var listlen0, listlen1 = 2
 
-  proc getValSum: int =  # you can use procs
+  proc getValSum: int =
     for v in vals:
       result += v
 
@@ -68,19 +68,19 @@ proc testComponent {.component.} =
       <>input(`type`="text", bind[value]=a)
 
     <%>titledBox(title="basic patching test"):
-      <%>editableNum(title="edit a", value=a); <>br
-      <%>editableNum(title="edit b", value=b); <>br
+      <%>editableNum[float](title="edit a", value=a); <>br
+      <%>editableNum[float](title="edit b", value=b); <>br
       text &"a + b = {a+b}"; <>br
 
-      <>button(on[click] = (inc a; inc b)):
+      <>button(on[click] = (a += 0.5; b += 0.5)):
         style:
           marginLeft := &"{a*4}px"
-        text "inc a and b"
+        text "inc a and b by 0.5"
 
     <%>titledBox(title="loop test"):
       
       for i, v in vals.mpairs:
-        <%>editableNum(title= "val" & $i, value=v); <>button(on[click] = (vals[i] += 2)); <>br
+        <%>editableNum[int](title= "val" & $i, value=v); <>button(on[click] = (vals[i] += 2)); <>br
 
       for v in vals:
         text $v; <>br
@@ -104,7 +104,7 @@ proc testComponent {.component.} =
 
       for row in matrix.mitems:
         for v in row.mitems:
-          <%>editableNum(value=v)
+          <%>editableNum[int](value=v)
         <>button(on[click] = (for v in row.mitems: inc v)) text "inc row"; <>br
 
     <%>titledBox(title="hook test (2 for loops)"):
@@ -114,8 +114,8 @@ proc testComponent {.component.} =
       for _ in 0 ..< listlen1:
         text "x"; <>br
       
-      <%>editableNum(title="list0", value=listlen0); <>br
-      <%>editableNum(title="list1", value=listlen1); <>br
+      <%>editableNum[int](title="list0", value=listlen0); <>br
+      <%>editableNum[int](title="list1", value=listlen1); <>br
 
       if listlen0 == 3:
         <>b text "listlen0 == 3"; <>br

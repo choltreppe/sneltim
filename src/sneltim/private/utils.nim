@@ -27,6 +27,13 @@ template findIt*(container, elem, get: untyped): untyped =
     inc i
   res
 
+
+proc map*(node: NimNode, f: proc(x: NimNode): NimNode): NimNode =
+  assert node.kind notin AtomicNodes
+  result = node.kind.newTree()
+  for node in node:
+    result.add f(node)
+
 func denestStmtList*(node: NimNode): NimNode =
   if node.kind == nnkStmtList:
     result = node
@@ -111,24 +118,23 @@ func getIfCondDefs*(node: NimNode): seq[NimNode] =
       result.add getIfCondDefs(node)
 
 
-func isVarType(td: NimNode): bool =
+func isVarType*(td: NimNode): bool =
+  td.kind == nnkVarTy or
   td.kind == nnkBracketExpr and td[0].kind == nnkSym and $td[0] == "var"
 
 func isVar*(node: NimNode): bool =
-  node.getType.isVarType
+  node.getTypeInst.isVarType
 
-func paramsMut*(node: NimNode): seq[bool] =
+func paramsVar*(node: NimNode): seq[bool] =
   for td in node.getType[2..^1]:
     result.add td.isVarType
 
-
-func defsGetVal*(defs: NimNode): NimNode =
-  defs.expectKind nnkIdentDefs
-  if defs[^1].kind == nnkEmpty:
-    let td = defs[^2]
-    newCall(
-      bindSym"default",
-      if td.kind == nnkVarTy: td[0]
-      else: td
-    )
-  else: defs[^1]
+func unVarType*(td: NimNode): NimNode =
+  if td.kind == nnkVarTy:
+    td[0]
+  elif td.kind == nnkBracketExpr and td[0].kind == nnkSym and $td[0] == "var":
+    td[1]
+  elif td.kind in {nnkBracketExpr, nnkCommand} and td[0].kind == nnkSym and $td[0] == "lent":
+    td[1]
+  else:
+    td

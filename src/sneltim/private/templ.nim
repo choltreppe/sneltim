@@ -200,68 +200,73 @@ proc extractStyleDef(body: NimNode): tuple[body, styleDef: NimNode] =
       quote do: some(newStyle(`styleDef`))
 
 proc newTemplTagImpl(call: NimNode, body = newEmptyNode()): NimNode =
-  let (call, bodyAndStyle) = cosiderCommandSyntax(call, body)
   let (callee, attrs, handlers) = destructureCall(call)
   callee.expectKind {nnkIdent, nnkSym}
-  let (body, styleDef) = extractStyleDef(bodyAndStyle)
+  let (body, styleDef) = extractStyleDef(body)
   result = newCall(bindSym"newTemplTag", newLit($callee), attrs, handlers, styleDef)
   if len(body) > 0:
-    result.add body.denestStmtList
+    assert body.kind == nnkStmtList
+    result.add: quote do:
+      proc = `body`
 
 proc newTemplComponentImpl(call: NimNode, body = newEmptyNode()): NimNode =
-  let (call, body) = cosiderCommandSyntax(call, body)
   let (callee, attrs, handlers) = destructureCall(call, bindable=false)
   if len(handlers) > 0:
     for handler in handlers: error "components dont have event handlers", handler[0]
-  callee.expectKind {nnkIdent, nnkSym}
+  #callee.expectKind {nnkIdent, nnkSym}
   result = newCall(bindSym"newTemplComponent", callee, attrs)
   if body.kind != nnkEmpty:
-    result.add body.denestStmtList
+    assert body.kind == nnkStmtList
+    result.add: quote do:
+      proc = `body`
 
 proc newTemplSlotImpl(slot: NimNode, body = newEmptyNode()): NimNode =
-  let (slot, body) = cosiderCommandSyntax(slot, body)
   slot.expectKind {nnkIdent, nnkSym}
   result = newCall(bindSym"newTemplSlot", newLit(slot.strVal))
   if body.kind != nnkEmpty:
-    result.add body.denestStmtList
+    assert body.kind == nnkStmtList
+    result.add: quote do:
+      proc = `body`
 
 proc newTemplSlotDefImpl(slot, body: NimNode): NimNode =
-  let (slot, body) = cosiderCommandSyntax(slot, body)
   slot.expectKind {nnkIdent, nnkSym}
   newCall(bindSym"newTemplSlotDef", newLit(slot.strVal), body.denestStmtList)
 
-template templToTypable(blockLabel, templDef: untyped) =
-  block:
+macro html*(body: untyped) =
+  proc toProcCalls(node: NimNode): NimNode =
+    proc stmtToProcCall(node: NimNode): NimNode =
+      case node.kind
+      of nnkCall, nnkCommand, nnkPrefix:
+        node[0].expectKind {nnkIdent, nnkSym}
+        node.expectLen 2, 3
 
-    macro text(s: string) {.inject.} =
-      newTemplTextImpl(s)
+        var (head, body) = cosiderCommandSyntax(
+          node[1],
+          if len(node) == 2: newEmptyNode()
+          else: node[2]
+        )
+        if body.kind != nnkEmpty:
+          body = body.toProcCalls
 
-    macro `<>`(call: untyped) {.inject.} =
-      newTemplTagImpl(call)
+        case ($node[0]).nimIdentNormalize
+        of "text":
+          body.expectKind nnkEmpty
+          newTemplTextImpl(head)
+        of "<>": newTemplTagImpl(head, body)
+        of "<%>": newTemplComponentImpl(head, body)
+        of "<..>": newTemplSlotImpl(head, body)
+        of "<=>": newTemplSlotDefImpl(head, body)
+        else: node
 
-    macro `<>`(call, body: untyped) {.inject.} =
-      newTemplTagImpl(call, body)
+      of AtomicNodes: node
+      else: node.map(toProcCalls)
 
-    macro `<%>`(call: untyped) {.inject.} =
-      newTemplComponentImpl(call)
+    if node.kind == nnkStmtList:
+      node.map(stmtToProcCall)
+    else:
+      node.stmtToProcCall
 
-    macro `<%>`(call, body: untyped) {.inject.} =
-      newTemplComponentImpl(call, body)
-
-    macro `<..>`(call: untyped) {.inject.} =
-      newTemplSlotImpl(call)
-
-    macro `<..>`(call, body: untyped) {.inject.} =
-      newTemplSlotImpl(call, body)
-
-    macro `<=>`(call, body: untyped) {.inject.} =
-      newTemplSlotDefImpl(call, body)
-
-    block blockLabel:
-      templDef
-
-macro html*(templDef: untyped) =
-  newCall(bindSym"templToTypable", templDefLabel, templDef)
+  nnkBlockStmt.newTree(templDefLabel, body.toProcCalls)
 
 
 proc tupleDefToTable(tupleDef: NimNode): Table[string, NimNode] =
@@ -304,7 +309,7 @@ proc parseTempl*(node: NimNode): Templ =
           elem.handlers[event] = action[6]
 
         assert node[4].kind == nnkCall
-        assert node[4][0].kind == nnkSym
+        assert node[4][0].kind in {nnkSym, nnkOpenSymChoice}
         if $node[4][0] == "some":
           elem.style = some((genSym(nskLet, "style"), node[4][1].removeMacroDefs))
 
