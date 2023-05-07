@@ -62,6 +62,10 @@ proc testComponent {.component.} =
     for v in vals:
       result += v
 
+  proc incAllVals =
+    for val in vals.mitems:
+      inc val
+
   html:
     
     <%>titledBox(title="binding test (bind a)"):
@@ -86,6 +90,7 @@ proc testComponent {.component.} =
         text $v; <>br
 
       <>b text &"sum: {getValSum()}"; <>br
+      <>button(on[click] = incAllVals()) text "inc all"; <>br
         
       <>button(on[click] = (vals &= 0)): text "add val"
       <>button(on[click] = (vals.setLen len(vals) - 1)): text "del val"

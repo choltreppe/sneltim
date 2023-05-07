@@ -47,9 +47,13 @@ proc add(pps: var PatchProcs, p: proc()) =
 proc add(pps: var PatchProcs, g: PatchProcs) =
   pps.procs.add PatchProcsNode(isGroup: true, group: g)
 
-proc connect(a,b: var PatchProcs) =
-  a.add b
-  b.add a
+proc connect[A,B](a: PatchRef[A], b: PatchRef[B]) =
+  a.patchProcs.add b.patchProcs
+  a.patchProcs.add proc =
+    b.prevVal = b.val[]
+  b.patchProcs.add a.patchProcs
+  b.patchProcs.add proc =
+    a.prevVal = a.val[]
 
 proc patch(pps: PatchProcs, skip: seq[proc()], visited = newSeq[PatchProcs]()) =
   if pps notin visited:
@@ -63,8 +67,8 @@ proc patch(pps: PatchProcs, skip: seq[proc()], visited = newSeq[PatchProcs]()) =
           pp.patchProc()
       inc i
 
-proc patch(pr: PatchRef, init = false) =
-  if pr.val[] != pr.prevVal or init:
+proc patch(pr: PatchRef) =
+  if pr.val[] != pr.prevVal:
     pr.prevVal = pr.val[]
     patch pr.patchProcs, pr.skipPatchProcs
 
@@ -617,7 +621,7 @@ proc componentBodyImpl(
             for i in val.getMemberRefs[refmAll]:
               let ownMember = members[i].unbindSyms
               procBody.add: quote do:
-                connect `elemSym`.pubMembers.`member`.patchProcs, `ownMember`.patchProcs
+                connect `elemSym`.pubMembers.`member`, `ownMember`
 
           procBody.add: quote do:
             `elemSym`.mount(`parent`, `getHook`)
@@ -751,6 +755,12 @@ proc componentBodyImpl(
         hookElemSym = elemSym
 
     buildProcBody(templ)
+
+    for member in members:
+      let member = member.unbindSyms
+      procBody.add: quote do:
+        `member`.prevVal = `member`.val[]
+
     quote do:
       proc (parent: Node, getHook: proc: Node) =
         `rootParent` = parent
